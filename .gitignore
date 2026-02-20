@@ -1,0 +1,28 @@
+# Rust / Cargo
+/target/
+Cargo.lock
+
+# Build artifacts
+/build/artifacts/
+*.tar.gz
+*.zip
+
+# Binaries
+reach-link
+reach-link-linux-*
+
+# Secrets / environment
+.env
+*.pem
+*.key
+*.crt
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            label: linux-arm64
+          - target: x86_64-unknown-linux-musl
+            label: linux-x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/reach-link dist/reach-link-${{ matrix.label }}
+          chmod +x dist/reach-link-${{ matrix.label }}
+          sha256sum dist/reach-link-${{ matrix.label }} | awk '{print $1}' > dist/reach-link-${{ matrix.label }}.sha256
+          echo "SHA256=$(cat dist/reach-link-${{ matrix.label }}.sha256)" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reach-link-${{ matrix.label }}
+          path: dist/
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: reach-link-linux-arm64
+          path: dist/
+
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: reach-link-linux-x86_64
+          path: dist/
+
+      - name: Read SHA-256 hashes
+        id: hashes
+        run: |
+          ARM64_SHA=$(cat dist/reach-link-linux-arm64.sha256)
+          X86_SHA=$(cat dist/reach-link-linux-x86_64.sha256)
+          echo "arm64_sha=${ARM64_SHA}" >> $GITHUB_OUTPUT
+          echo "x86_sha=${X86_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/reach-link-linux-arm64
+            dist/reach-link-linux-x86_64
+            dist/reach-link-linux-arm64.sha256
+            dist/reach-link-linux-x86_64.sha256
+          body: |
+            ## reach-link ${{ github.ref_name }}
+
+            ### Checksums
+
+            **SHA-256 (arm64):** `${{ steps.hashes.outputs.arm64_sha }}`
+            **SHA-256 (x86_64):** `${{ steps.hashes.outputs.x86_sha }}`
+
+            ### Usage in Reach3DCommercial
+
+            ```env
+            REACH_LINK_BINARY_URL=https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-linux-arm64
+            REACH_LINK_BINARY_SHA256=${{ steps.hashes.outputs.arm64_sha }}
+            ```
+
+            ### Quick install (arm64)
+
+            ```bash
+            curl -fsSL https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-linux-arm64 \
+              -o /usr/local/bin/reach-link
+            echo "${{ steps.hashes.outputs.arm64_sha }}  /usr/local/bin/reach-link" | sha256sum -c
+            chmod +x /usr/local/bin/reach-link
+            ```
