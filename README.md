@@ -32,7 +32,7 @@
 ## Requirements
 
 - Rust stable (≥ 1.75) — install via [rustup](https://rustup.rs/)
-- [`cross`](https://github.com/cross-rs/cross) for cross-compilation (arm64 / x86_64)
+- [`cross`](https://github.com/cross-rs/cross) for cross-compilation (arm64, x86_64, MIPS)
 - Docker (required by `cross`)
 
 ---
@@ -74,7 +74,7 @@ make build
 # Run tests
 make test
 
-# Cross-compile for arm64 and x86_64 (requires `cross` + Docker)
+# Cross-compile for arm64, x86_64, and MIPS (requires `cross` + Docker)
 make cross
 
 # Remove build artifacts
@@ -98,10 +98,16 @@ git push origin v1.0.0
 
 The workflow (`.github/workflows/release.yml`) will:
 
-1. Cross-compile binaries for `linux-arm64` and `linux-x86_64`
+1. Cross-compile binaries for `linux-arm64`, `linux-x86_64`, `linux-mips`, and `linux-mipsel`
 2. Compute SHA-256 checksums
 3. Create a GitHub Release with all binaries and checksums attached
 4. Include usage instructions in the release body
+
+**Supported Architectures:**
+- `linux-arm64` - ARM 64-bit (Raspberry Pi 3/4/5, most modern SBCs)
+- `linux-x86_64` - x86 64-bit (Intel/AMD systems)
+- `linux-mips` - MIPS 32-bit big-endian (some embedded systems)
+- `linux-mipsel` - MIPS 32-bit little-endian (Creality K1/K1C and similar)
 
 ---
 

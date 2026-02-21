@@ -19,6 +19,10 @@ jobs:
             label: linux-arm64
           - target: x86_64-unknown-linux-musl
             label: linux-x86_64
+          - target: mipsel-unknown-linux-musl
+            label: linux-mipsel
+          - target: mips-unknown-linux-musl
+            label: linux-mips
 
     steps:
       - name: Checkout
@@ -69,13 +73,29 @@ jobs:
           name: reach-link-linux-x86_64
           path: dist/
 
+      - name: Download mipsel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: reach-link-linux-mipsel
+          path: dist/
+
+      - name: Download mips artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: reach-link-linux-mips
+          path: dist/
+
       - name: Read SHA-256 hashes
         id: hashes
         run: |
           ARM64_SHA=$(cat dist/reach-link-linux-arm64.sha256)
           X86_SHA=$(cat dist/reach-link-linux-x86_64.sha256)
+          MIPSEL_SHA=$(cat dist/reach-link-linux-mipsel.sha256)
+          MIPS_SHA=$(cat dist/reach-link-linux-mips.sha256)
           echo "arm64_sha=${ARM64_SHA}" >> $GITHUB_OUTPUT
           echo "x86_sha=${X86_SHA}" >> $GITHUB_OUTPUT
+          echo "mipsel_sha=${MIPSEL_SHA}" >> $GITHUB_OUTPUT
+          echo "mips_sha=${MIPS_SHA}" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -83,8 +103,12 @@ jobs:
           files: |
             dist/reach-link-linux-arm64
             dist/reach-link-linux-x86_64
+            dist/reach-link-linux-mipsel
+            dist/reach-link-linux-mips
             dist/reach-link-linux-arm64.sha256
             dist/reach-link-linux-x86_64.sha256
+            dist/reach-link-linux-mipsel.sha256
+            dist/reach-link-linux-mips.sha256
           body: |
             ## reach-link ${{ github.ref_name }}
 
@@ -92,6 +116,8 @@ jobs:
 
             **SHA-256 (arm64):** `${{ steps.hashes.outputs.arm64_sha }}`
             **SHA-256 (x86_64):** `${{ steps.hashes.outputs.x86_sha }}`
+            **SHA-256 (mipsel):** `${{ steps.hashes.outputs.mipsel_sha }}`
+            **SHA-256 (mips):** `${{ steps.hashes.outputs.mips_sha }}`
 
             ### Usage in Reach3DCommercial
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# cross-build.sh — cross-compile reach-link for Linux arm64 and x86_64
+# cross-build.sh — cross-compile reach-link for Linux arm64, x86_64, and MIPS
 # Requires: cross (https://github.com/cross-rs/cross) or cargo with appropriate targets
 set -euo pipefail
 
 BINARY_NAME="reach-link"
-TARGETS=("aarch64-unknown-linux-musl" "x86_64-unknown-linux-musl")
-LABELS=("linux-arm64" "linux-x86_64")
+TARGETS=("aarch64-unknown-linux-musl" "x86_64-unknown-linux-musl" "mipsel-unknown-linux-musl" "mips-unknown-linux-musl")
+LABELS=("linux-arm64" "linux-x86_64" "linux-mipsel" "linux-mips")
 OUT_DIR="$(dirname "$0")/artifacts"
 
 mkdir -p "$OUT_DIR"
