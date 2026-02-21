@@ -1,6 +1,6 @@
 [package]
 name = "reach-link"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Cross-platform printer agent for Klipper/Moonraker 3D printers"
 license = "MIT"

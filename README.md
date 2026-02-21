@@ -32,8 +32,10 @@
 ## Requirements
 
 - Rust stable (≥ 1.75) — install via [rustup](https://rustup.rs/)
-- [`cross`](https://github.com/cross-rs/cross) for cross-compilation (arm64, x86_64, MIPS)
+- [`cross`](https://github.com/cross-rs/cross) for cross-compilation (ARM64, x86_64)
 - Docker (required by `cross`)
+
+> **MIPS Note:** Creality K1/K1C (MIPS) requires native compilation on-device. See [MIPS Build Instructions](#mips-build-instructions) below.
 
 ---
 
@@ -74,7 +76,7 @@ make build
 # Run tests
 make test
 
-# Cross-compile for arm64, x86_64, and MIPS (requires `cross` + Docker)
+# Cross-compile for ARM64 and x86_64 (requires `cross` + Docker)
 make cross
 
 # Remove build artifacts
@@ -98,7 +100,7 @@ git push origin v1.0.0
 
 The workflow (`.github/workflows/release.yml`) will:
 
-1. Cross-compile binaries for `linux-arm64`, `linux-x86_64`, `linux-mips`, and `linux-mipsel`
+1. Cross-compile binaries for `linux-arm64` and `linux-x86_64`
 2. Compute SHA-256 checksums
 3. Create a GitHub Release with all binaries and checksums attached
 4. Include usage instructions in the release body
@@ -106,8 +108,8 @@ The workflow (`.github/workflows/release.yml`) will:
 **Supported Architectures:**
 - `linux-arm64` - ARM 64-bit (Raspberry Pi 3/4/5, most modern SBCs)
 - `linux-x86_64` - x86 64-bit (Intel/AMD systems)
-- `linux-mips` - MIPS 32-bit big-endian (some embedded systems)
-- `linux-mipsel` - MIPS 32-bit little-endian (Creality K1/K1C and similar)
+
+**MIPS Support:** Creality K1/K1C and other MIPS printers require native compilation (see below).
 
 ---
 
@@ -161,6 +163,42 @@ REACH_LINK_PRINTER_ID=printer-abc123
 ```bash
 systemctl enable --now reach-link
 ```
+
+---
+
+## MIPS Build Instructions
+
+**For Creality K1/K1C and other MIPS printers:**
+
+MIPS cross-compilation with `cross` is not currently supported due to limited Tier 3 target support in Rust. You can compile natively on the device:
+
+### Option 1: Native compilation on K1C
+
+```bash
+# SSH into your K1C
+ssh root@<K1C_IP>
+
+# Install build dependencies (if not present)
+# Note: K1C uses a minimal BusyBox environment, Rust may need to be built from source
+# or use a pre-compiled Rust toolchain for MIPS
+
+# Clone and build
+cd /tmp
+git clone https://github.com/Reach-3D/reach-link.git
+cd reach-link
+cargo build --release --target mips-unknown-linux-musl
+
+# Copy binary to install location
+cp target/mips-unknown-linux-musl/release/reach-link /usr/data/reach-link/bin/
+```
+
+### Option 2: Cross-compile with custom Docker
+
+See [cross-rs/cross#467](https://github.com/cross-rs/cross/issues/467) for community MIPS Docker images.
+
+### Option 3: Request pre-built MIPS binary
+
+Open an issue on GitHub if you need MIPS support - we can add custom build pipelines if there's demand.
 
 ---
 
