@@ -9,149 +9,122 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.label }}
+  release:
+    name: Publish Python Agent Release
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-unknown-linux-musl
-            label: linux-arm64
-          - target: x86_64-unknown-linux-musl
-            label: linux-x86_64
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
-      - name: Build
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Prepare artifact
+      - name: Prepare Python Agent
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/reach-link dist/reach-link-${{ matrix.label }}
-          chmod +x dist/reach-link-${{ matrix.label }}
-          sha256sum dist/reach-link-${{ matrix.label }} | awk '{print $1}' > dist/reach-link-${{ matrix.label }}.sha256
-          echo "SHA256=$(cat dist/reach-link-${{ matrix.label }}.sha256)" >> $GITHUB_ENV
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: reach-link-${{ matrix.label }}
-          path: dist/
-
-  release:
-    name: Publish GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download arm64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: reach-link-linux-arm64
-          path: dist/
-
-      - name: Download x86_64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: reach-link-linux-x86_64
-          path: dist/
-
-      - name: Prepare Python script for MIPS
-        run: |
-          cp src/reach-link-agent.py dist/reach-link-mips.py
-          chmod +x dist/reach-link-mips.py
-          sha256sum dist/reach-link-mips.py | awk '{print $1}' > dist/reach-link-mips.py.sha256
-          MIPS_SHA=$(cat dist/reach-link-mips.py.sha256)
-          echo "mips_sha=${MIPS_SHA}" >> $GITHUB_ENV
-
-      - name: Read SHA-256 hashes
-        id: hashes
-        run: |
-          ARM64_SHA=$(cat dist/reach-link-linux-arm64.sha256)
-          X86_SHA=$(cat dist/reach-link-linux-x86_64.sha256)
-          MIPS_SHA=$(cat dist/reach-link-mips.py.sha256)
-          echo "arm64_sha=${ARM64_SHA}" >> $GITHUB_OUTPUT
-          echo "x86_sha=${X86_SHA}" >> $GITHUB_OUTPUT
-          echo "mips_sha=${MIPS_SHA}" >> $GITHUB_OUTPUT
+          cp src/reach-link-agent.py dist/reach-link.py
+          chmod +x dist/reach-link.py
+          sha256sum dist/reach-link.py | awk '{print $1}' > dist/reach-link.py.sha256
+          echo "SHA256=$(cat dist/reach-link.py.sha256)" >> $GITHUB_ENV
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/reach-link-linux-arm64
-            dist/reach-link-linux-x86_64
-            dist/reach-link-mips.py
-            dist/reach-link-linux-arm64.sha256
-            dist/reach-link-linux-x86_64.sha256
-            dist/reach-link-mips.py.sha256
+            dist/reach-link.py
+            dist/reach-link.py.sha256
           body: |
             ## reach-link ${{ github.ref_name }}
 
-            ### Checksums
+            ### Universal Python Agent
 
-            **SHA-256 (arm64):** `${{ steps.hashes.outputs.arm64_sha }}`
-            **SHA-256 (x86_64):** `${{ steps.hashes.outputs.x86_sha }}`
-            **SHA-256 (MIPS):** `${{ steps.hashes.outputs.mips_sha }}`
+            A single Python script for all platforms: ARM64, x86_64, MIPS, and others.
+
+            **SHA-256:** `${{ env.SHA256 }}`
 
             ### Downloads
 
-            #### ARM64 (Raspberry Pi, etc.)
             ```bash
-            wget https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-linux-arm64
+            # Download the universal Python agent
+            wget https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link.py
+            
+            # Verify checksum
+            echo "${{ env.SHA256 }}  reach-link.py" | sha256sum -c
+            
+            # Make executable
+            chmod +x reach-link.py
             ```
 
-            #### x86_64 (Intel/AMD systems)
+            ### Requirements
+
+            - Python 3.7+
+            - Moonraker API available on the printer
+
+            ### Installation
+
+            #### Via Reach3DCommercial Installer (Recommended)
+            The installer automatically detects your printer and deploys reach-link.py.
+
+            #### Manual Installation
+
             ```bash
-            wget https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-linux-x86_64
+            # SSH into your printer
+            ssh root@<printer-ip>
+            
+            # Create directory and download
+            mkdir -p /root/reach-link
+            cd /root/reach-link
+            wget https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link.py
+            chmod +x reach-link.py
+            
+            # Create .env file
+            cat > .env << 'EOF'
+            REACH_LINK_RELAY=https://relay.reach-3d.com
+            REACH_LINK_TOKEN=your-secret-token
+            REACH_LINK_PRINTER_ID=printer-id
+            REACH_LINK_MOONRAKER_URL=http://127.0.0.1:7125
+            EOF
+            
+            # Set up as a systemd service or supervisor job
+            # See README for examples
             ```
 
-            #### MIPS (Creality K1/K1C - Python-based)
-            Requires Python 3.7+ and `requests` library
-            ```bash
-            wget https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-mips.py
-            chmod +x reach-link-mips.py
-            ```
+            ### Configuration
 
-            ### Usage in Reach3DCommercial
+            All configuration via environment variables:
 
-            The installer automatically detects your printer's CPU architecture and deploys the correct agent.
+            | Variable | Required | Default | Description |
+            |----------|----------|---------|-------------|
+            | `REACH_LINK_RELAY` | ✅ | - | HTTPS URL of Reach relay server |
+            | `REACH_LINK_TOKEN` | ✅ | - | Bearer token for authentication |
+            | `REACH_LINK_PRINTER_ID` | ✅ | - | Unique printer identifier |
+            | `REACH_LINK_MOONRAKER_URL` | ❌ | `http://127.0.0.1:7125` | Moonraker API endpoint |
+            | `REACH_LINK_HEARTBEAT_INTERVAL` | ❌ | `30` | Heartbeat interval (seconds) |
+            | `REACH_LINK_TELEMETRY_INTERVAL` | ❌ | `10` | Telemetry interval (seconds) |
+            | `REACH_LINK_LOG_FILE` | ❌ | - | Optional log file path |
 
-            #### Manual deployment (arm64)
-            ```bash
-            curl -fsSL https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-linux-arm64 \
-              -o reach-link
-            echo "${{ steps.hashes.outputs.arm64_sha }}  reach-link" | sha256sum -c
-            chmod +x reach-link
-            REACH_LINK_RELAY=https://relay.reach-3d.com \
-            REACH_LINK_TOKEN=your-token \
-            REACH_LINK_PRINTER_ID=printer-id \
-            ./reach-link
-            ```
+            ### Features
 
-            #### Manual deployment (MIPS)
-            ```bash
-            curl -fsSL https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-mips.py \
-              -o reach-link-agent.py
-            echo "${{ steps.hashes.outputs.mips_sha }}  reach-link-agent.py" | sha256sum -c
-            chmod +x reach-link-agent.py
-            REACH_LINK_RELAY=https://relay.reach-3d.com \
-            REACH_LINK_TOKEN=your-token \
-            REACH_LINK_PRINTER_ID=printer-id \
-            python3 reach-link-agent.py
-            ```
+            - 🌍 **Universal**: Works on ARM64, x86_64, MIPS, and any Linux with Python 3.7+
+            - 📤 **Telemetry**: Sends temperatures, job progress, system health to Reach relay
+            - 💓 **Heartbeat**: Registers every 30s to keep printer online
+            - 🔐 **Secure**: HTTPS with bearer token authentication
+            - 🔄 **Resilient**: Automatic retry with exponential backoff
+            - 📝 **Logging**: Detailed stdout + optional file logging
+            - 🚫 **No Dependencies**: Minimal requirements (requests + tenacity optional, fallback to stdlib)
+
+            ### Troubleshooting
+
+            **"ModuleNotFoundError: No module named 'requests'"**
+            - Install: `pip3 install requests==2.31.0`
+            - Or script will fall back to stdlib urllib
+
+            **"Connection refused" to Moonraker**
+            - Verify Moonraker is running on port 7125 (or check `REACH_LINK_MOONRAKER_URL`)
+
+            **Python 3 not found**
+            - Install: `apt-get install python3` (Debian/Ubuntu) or equivalent
+
+            ### Documentation
+
+            - [GitHub Repository](https://github.com/Reach-3D/reach-link)
+            - [Reach3D Documentation](https://reach3d.com/docs)
+            - [Moonraker Project](https://moonraker.readthedocs.io/)
