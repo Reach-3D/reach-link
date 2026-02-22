@@ -535,21 +535,39 @@ class ReachLinkAgent:
         
         return False
     
-    def proxy_command_to_moonraker(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    def proxy_command_to_moonraker(self, command: str, params: Dict[str, Any], user_ip: Optional[str] = None) -> Dict[str, Any]:
         """
         Proxy Moonraker API request to the printer's Moonraker instance.
+        Intelligently routes to localhost (127.0.0.1:7125) for local WiFi users,
+        or to the printer's WiFi IP:7125 for remote users.
         
         Example:
           command: "printer.gcode.script"
           params: { "script": "M109 S200" }
+          user_ip: "192.168.1.100" (optional)
         
         Returns: { "result": {...} } or { "error": "..." }
         """
         try:
+            # Determine target Moonraker URL based on user location
+            moonraker_base = "http://127.0.0.1:7125"  # Default to localhost
+            
+            # Check if user is on same WiFi (local) vs remote
+            if user_ip and self.subnet_detector:
+                is_local = self.subnet_detector.is_same_subnet(user_ip)
+                if not is_local and self.config.printer_ip:
+                    # User is remote: route through printer's WiFi IP
+                    moonraker_base = f"http://{self.config.printer_ip}:7125"
+                    logger.debug(f"Remote user {user_ip}: routing to printer IP {self.config.printer_ip}:7125")
+                else:
+                    logger.debug(f"Local user {user_ip}: routing to localhost 127.0.0.1:7125")
+            else:
+                logger.debug("No user IP or subnet detector: using default localhost routing")
+            
             # Construct Moonraker API endpoint
-            # Most commands map directly: "printer.gcode" -> "/printer/gcode
+            # Most commands map directly: "printer.gcode" -> "/printer/gcode"
             path = "/" + command.replace(".", "/")
-            url = f"{self.config.moonraker_url}{path}"
+            url = f"{moonraker_base}{path}"
             
             # Build request body
             body = json.dumps(params or {}).encode("utf-8")
@@ -574,6 +592,7 @@ class ReachLinkAgent:
     def process_pending_commands(self) -> int:
         """
         Read pending commands from RTDB, execute them, and write responses.
+        Intelligently routes to local or remote Moonraker based on user IP.
         Returns count of commands processed.
         """
         if not self.rtdb:
@@ -589,16 +608,17 @@ class ReachLinkAgent:
                     command = command_data.get("command", "")
                     params = command_data.get("params", {})
                     user_id = command_data.get("userId", "")
+                    user_ip = command_data.get("userIp", "")  # Extract user IP for routing
                     
                     if not command:
                         logger.warning(f"Skipping command {request_id}: no command specified")
                         self.rtdb.delete_command(request_id)
                         continue
                     
-                    logger.debug(f"Processing command {request_id}: {command}")
+                    logger.debug(f"Processing command {request_id}: {command} from user {user_id} (IP: {user_ip})")
                     
-                    # Proxy to Moonraker
-                    result = self.proxy_command_to_moonraker(command, params)
+                    # Proxy to Moonraker with user IP for intelligent routing
+                    result = self.proxy_command_to_moonraker(command, params, user_ip if user_ip else None)
                     
                     # Write response
                     if "error" in result:
