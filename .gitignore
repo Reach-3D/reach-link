@@ -1,15 +1,6 @@
-# Rust / Cargo
-/target/
-Cargo.lock
-
-# Build artifacts
-/build/artifacts/
+# Artifacts
 *.tar.gz
 *.zip
-
-# Binaries
-reach-link
-reach-link-linux-*
 
 # Secrets / environment
 .env
