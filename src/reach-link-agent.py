@@ -364,6 +364,103 @@ class RelayClient:
         return False
 
 # ============================================================================
+# Firebase Realtime Database Client (REST API, no external dependencies)
+# ============================================================================
+
+class FirebaseRTDB:
+    """Firebase Realtime Database client using REST API."""
+    
+    COMMON_RTDB_URL = "https://reach3d-default-rtdb.firebaseio.com"
+    
+    def __init__(self, firebase_token: str, printer_id: str, relay_url: str):
+        self.firebase_token = firebase_token
+        self.printer_id = printer_id
+        # Extract RTDB base URL from relay URL if available, otherwise use default
+        self.rtdb_url = self._extract_rtdb_url(relay_url) or self.COMMON_RTDB_URL
+    
+    @staticmethod
+    def _extract_rtdb_url(relay_url: str) -> Optional[str]:
+        """
+        Extract RTDB URL from relay_url if embedded, otherwise None.
+        Example: 'https://service.com/api' might contain a config with RTDB URL.
+        For now, returning None to use default.
+        """
+        return None
+    
+    def read_commands(self) -> Dict[str, Any]:
+        """
+        Read commands from /printers/{printerId}/QUERY
+        Returns dict of { requestId: { command, params, ... } }
+        """
+        url = f"{self.rtdb_url}/printers/{self.printer_id}/QUERY.json?auth={self.firebase_token}"
+        try:
+            response = HTTPClient.get_json(url, timeout=5, max_retries=2)
+            if response and isinstance(response, dict):
+                logger.debug(f"Read {len(response)} pending commands")
+                return response
+            return {}
+        except Exception as e:
+            logger.debug(f"Error reading commands: {e}")
+            return {}
+    
+    def delete_command(self, request_id: str) -> bool:
+        """Delete a command after processing."""
+        url = f"{self.rtdb_url}/printers/{self.printer_id}/QUERY/{request_id}.json?auth={self.firebase_token}"
+        try:
+            req = Request(url, method="DELETE")
+            with urlopen(req, timeout=5) as response:
+                if response.status == 200:
+                    logger.debug(f"Deleted command {request_id}")
+                    return True
+        except Exception as e:
+            logger.warning(f"Error deleting command {request_id}: {e}")
+        return False
+    
+    def write_response(self, request_id: str, status: str, result: Any, error_code: Optional[str] = None) -> bool:
+        """
+        Write command response to /printers/{printerId}/RESPONSE/{requestId}
+        """
+        url = f"{self.rtdb_url}/printers/{self.printer_id}/RESPONSE/{request_id}.json?auth={self.firebase_token}"
+        payload = {
+            "requestId": request_id,
+            "status": status,
+            "result": result,
+            "timestamp": int(time.time() * 1000),
+        }
+        if error_code:
+            payload["errorCode"] = error_code
+        
+        body = json.dumps(payload).encode("utf-8")
+        try:
+            req = Request(url, data=body, method="PUT", headers={"Content-Type": "application/json"})
+            with urlopen(req, timeout=5) as response:
+                if response.status in (200, 201):
+                    logger.debug(f"Wrote response for {request_id}")
+                    return True
+        except Exception as e:
+            logger.error(f"Error writing response: {e}")
+        return False
+    
+    def update_heartbeat(self, uptime: int, status: str = "online") -> bool:
+        """Update heartbeat in RTDB."""
+        url = f"{self.rtdb_url}/printers/{self.printer_id}/heartbeat.json?auth={self.firebase_token}"
+        payload = {
+            "connected": True,
+            "lastHeartbeat": datetime.now().isoformat(),
+            "uptime": uptime,
+            "status": status,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        try:
+            req = Request(url, data=body, method="PATCH", headers={"Content-Type": "application/json"})
+            with urlopen(req, timeout=5) as response:
+                if response.status in (200, 201):
+                    return True
+        except Exception as e:
+            logger.debug(f"Error updating heartbeat in RTDB: {e}")
+        return False
+
+# ============================================================================
 # Main Agent
 # ============================================================================
 
@@ -374,10 +471,21 @@ class ReachLinkAgent:
         self.config = config
         self.moonraker = MoonrakerClient(config.moonraker_url)
         self.relay = RelayClient(config.relay_url, config.token, config.printer_id)
+        
+        # Firebase RTDB client (only if credentials available)
+        self.rtdb = None
+        if config.firebase_token:
+            self.rtdb = FirebaseRTDB(config.firebase_token, config.printer_id, config.relay_url)
+            logger.info("Firebase RTDB client initialized for command proxying")
+        
+        self.subnet_detector = SubnetDetector(config.printer_ip) if config.printer_ip else None
+        
         self.shutdown_event = asyncio.Event()
         self.start_time = time.time()
         self.last_heartbeat = 0.0
         self.last_telemetry = 0.0
+        self.last_token_refresh = time.time()
+        self.token_expires_at = 0.0
     
     def setup_signal_handlers(self):
         """Register SIGTERM/SIGINT handlers for graceful shutdown."""
@@ -387,6 +495,144 @@ class ReachLinkAgent:
         
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
+    
+    def should_refresh_token(self) -> bool:
+        """Check if token should be refreshed (before expiry)."""
+        now = time.time()
+        # Refresh 10 minutes before expiry (600 seconds)
+        return (self.token_expires_at > 0) and (now > (self.token_expires_at - 600))
+    
+    def refresh_firebase_token(self) -> bool:
+        """
+        Call /api/reach-link/auth/refresh to get a new token.
+        Returns True if successful.
+        """
+        if not self.config.user_id or not self.config.firebase_token:
+            return False
+        
+        try:
+            url = urljoin(self.config.relay_url, "/api/reach-link/auth/refresh")
+            payload = {
+                "printerId": self.config.printer_id,
+                "userId": self.config.user_id,
+                "expiredToken": self.config.firebase_token,
+            }
+            
+            response = HTTPClient.post_json(url, payload, self.config.token, timeout=10)
+            if response and response.get("token"):
+                old_token = self.config.firebase_token
+                self.config.firebase_token = response["token"]
+                self.token_expires_at = response.get("expiresAt", 0) / 1000.0  # Convert ms to seconds
+                
+                # Update RTDB client with new token
+                if self.rtdb:
+                    self.rtdb.firebase_token = self.config.firebase_token
+                
+                logger.info(f"Firebase token refreshed (expires in {response.get('expiresIn', '?')} seconds)")
+                return True
+        except Exception as e:
+            logger.error(f"Token refresh failed: {e}")
+        
+        return False
+    
+    def proxy_command_to_moonraker(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Proxy Moonraker API request to the printer's Moonraker instance.
+        
+        Example:
+          command: "printer.gcode.script"
+          params: { "script": "M109 S200" }
+        
+        Returns: { "result": {...} } or { "error": "..." }
+        """
+        try:
+            # Construct Moonraker API endpoint
+            # Most commands map directly: "printer.gcode" -> "/printer/gcode
+            path = "/" + command.replace(".", "/")
+            url = f"{self.config.moonraker_url}{path}"
+            
+            # Build request body
+            body = json.dumps(params or {}).encode("utf-8")
+            
+            # POST to Moonraker
+            req = Request(
+                url,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"}
+            )
+            
+            with urlopen(req, timeout=10) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+                logger.debug(f"Moonraker responded to {command}: {response.status}")
+                return response_data
+        
+        except Exception as e:
+            logger.error(f"Moonraker proxy error for {command}: {e}")
+            return {"error": str(e), "errorCode": "moonraker_error"}
+    
+    def process_pending_commands(self) -> int:
+        """
+        Read pending commands from RTDB, execute them, and write responses.
+        Returns count of commands processed.
+        """
+        if not self.rtdb:
+            return 0
+        
+        try:
+            commands = self.rtdb.read_commands()
+            processed_count = 0
+            
+            for request_id, command_data in commands.items():
+                try:
+                    # Extract command info
+                    command = command_data.get("command", "")
+                    params = command_data.get("params", {})
+                    user_id = command_data.get("userId", "")
+                    
+                    if not command:
+                        logger.warning(f"Skipping command {request_id}: no command specified")
+                        self.rtdb.delete_command(request_id)
+                        continue
+                    
+                    logger.debug(f"Processing command {request_id}: {command}")
+                    
+                    # Proxy to Moonraker
+                    result = self.proxy_command_to_moonraker(command, params)
+                    
+                    # Write response
+                    if "error" in result:
+                        self.rtdb.write_response(
+                            request_id,
+                            "error",
+                            result,
+                            error_code=result.get("errorCode", "unknown_error")
+                        )
+                    else:
+                        self.rtdb.write_response(
+                            request_id,
+                            "success",
+                            result
+                        )
+                    
+                    # Delete command after processing
+                    self.rtdb.delete_command(request_id)
+                    processed_count += 1
+                
+                except Exception as e:
+                    logger.error(f"Error processing command {request_id}: {e}")
+                    # Still delete the command to avoid infinite retries
+                    self.rtdb.delete_command(request_id)
+            
+            if processed_count > 0:
+                logger.info(f"Processed {processed_count} commands from RTDB")
+            
+            return processed_count
+        
+        except Exception as e:
+            logger.error(f"Error reading commands from RTDB: {e}")
+            return 0
+    
     
     async def run(self):
         """Main agent loop."""
@@ -412,14 +658,39 @@ class ReachLinkAgent:
         
         self.setup_signal_handlers()
         
+        # Initialize token expiration if Firebase token is available
+        if self.config.firebase_token:
+            # Assume token was just generated (60 min TTL)
+            self.token_expires_at = time.time() + 3600
+            logger.info("Firebase token initialized (60 min TTL)")
+        
         while not self.shutdown_event.is_set():
             try:
                 now = time.time()
                 uptime = int(now - self.start_time)
                 
-                # Heartbeat
+                # Token refresh (every 50 minutes, 10 min before expiry)
+                if self.should_refresh_token():
+                    logger.info("Refreshing Firebase token before expiry...")
+                    if self.refresh_firebase_token():
+                        self.last_token_refresh = now
+                    else:
+                        logger.warning("Token refresh failed; attempting to continue with current token")
+                
+                # Heartbeat to HTTP relay
                 if now - self.last_heartbeat >= self.config.heartbeat_interval:
+                    heartbeat_payload = {
+                        "printerId": self.config.printer_id,
+                        "userId": self.config.user_id,
+                        "uptime": uptime,
+                        "version": "1.0.5",
+                    }
                     self.relay.register_heartbeat(uptime)
+                    
+                    # Also update RTDB heartbeat if available
+                    if self.rtdb:
+                        self.rtdb.update_heartbeat(uptime, "online")
+                    
                     self.last_heartbeat = now
                 
                 # Telemetry
@@ -428,6 +699,10 @@ class ReachLinkAgent:
                     if moonraker_status:
                         self.relay.send_telemetry(moonraker_status)
                     self.last_telemetry = now
+                
+                # Process pending commands from RTDB (if available)
+                if self.rtdb:
+                    self.process_pending_commands()
                 
                 # Sleep briefly to avoid busy-waiting
                 await asyncio.sleep(1)
