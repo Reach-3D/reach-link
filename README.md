@@ -12,6 +12,8 @@
 - [Building locally](#building-locally)
 - [Release process](#release-process)
 - [Installation on a printer](#installation-on-a-printer)
+- [Supported architectures](#supported-architectures)
+- [MIPS build instructions](#mips-build-instructions)
 - [Security notes](#security-notes)
 - [Repository structure](#repository-structure)
 
@@ -170,35 +172,106 @@ systemctl enable --now reach-link
 
 **For Creality K1/K1C and other MIPS printers:**
 
-MIPS cross-compilation with `cross` is not currently supported due to limited Tier 3 target support in Rust. You can compile natively on the device:
+As of v1.0.4, MIPS support is provided via a **Python-based agent** (`reach-link-mips.py`) published in each release. This avoids the complexity of cross-compilation for Tier-3 Rust targets.
 
-### Option 1: Native compilation on K1C
+### Installation via Reach3DCommercial
 
-```bash
-# SSH into your K1C
-ssh root@<K1C_IP>
+The Reach 3D installer automatically detects your printer's architecture and deploys the correct agent (Rust binary for ARM64/x86_64, Python script for MIPS).
 
-# Install build dependencies (if not present)
-# Note: K1C uses a minimal BusyBox environment, Rust may need to be built from source
-# or use a pre-compiled Rust toolchain for MIPS
+### Manual Installation on K1C
 
-# Clone and build
-cd /tmp
-git clone https://github.com/Reach-3D/reach-link.git
-cd reach-link
-cargo build --release --target mips-unknown-linux-musl
+1. **Download the Python script:**
+   ```bash
+   wget https://github.com/Reach-3D/reach-link/releases/download/v1.0.4/reach-link-mips.py
+   chmod +x reach-link-mips.py
+   ```
 
-# Copy binary to install location
-cp target/mips-unknown-linux-musl/release/reach-link /usr/data/reach-link/bin/
+2. **Verify the SHA-256 checksum:**
+   ```bash
+   echo "<hash from release page>  reach-link-mips.py" | sha256sum -c
+   ```
+
+3. **Install dependencies (if not present):**
+   The Python agent requires Python 3.7+ and the `requests` library.
+   ```bash
+   # Check Python version
+   python3 --version
+   
+   # Install requests (if pip is available)
+   pip3 install requests==2.31.0 tenacity==8.2.3
+   ```
+
+4. **Create a `.env` file with configuration:**
+   ```bash
+   mkdir -p /root/reach-link
+   cat > /root/reach-link/.env << EOF
+   REACH_LINK_RELAY=https://relay.reach3d.com
+   REACH_LINK_TOKEN=your-secret-token
+   REACH_LINK_PRINTER_ID=printer-abc123
+   REACH_LINK_MOONRAKER_URL=http://127.0.0.1:7125
+   REACH_LINK_HEARTBEAT_INTERVAL=30
+   REACH_LINK_TELEMETRY_INTERVAL=10
+   EOF
+   ```
+
+5. **Run the script:**
+   ```bash
+   python3 /root/reach-link/reach-link-mips.py
+   ```
+
+6. **Set up as a service (supervisor/systemd):**
+   Create a supervisor config or systemd unit to auto-start the Python agent. See [supervisor.conf example](#supervisor-config-example) below.
+
+### Supervisor Config Example
+
+If your K1C uses supervisor (typical for Creality OS):
+
+```ini
+[program:reach-link]
+command=/usr/bin/python3 /root/reach-link/reach-link-mips.py
+autostart=true
+autorestart=true
+stopasgroup=true
 ```
 
-### Option 2: Cross-compile with custom Docker
+Place in `/usr/data/printer_data/config/supervisor/conf.d/reach-link.conf` and run:
+```bash
+supervisorctl reread
+supervisorctl update
+supervisorctl start reach-link
+```
 
-See [cross-rs/cross#467](https://github.com/cross-rs/cross/issues/467) for community MIPS Docker images.
+### Python Agent Features
 
-### Option 3: Request pre-built MIPS binary
+- **Same protocol as Rust binary:** heartbeats and telemetry payloads are identical
+- **Pure Python stdlib fallback:** uses `urllib` if `requests` is not available (no external dependencies required)
+- **Graceful restart:** SIGTERM handling for clean shutdown
+- **Moonraker API queries:** reads temperatures, job state, and system health from Moonraker's introspection API
+- **Configurable intervals:** heartbeat (default 30s) and telemetry (default 10s)
 
-Open an issue on GitHub if you need MIPS support - we can add custom build pipelines if there's demand.
+### Troubleshooting
+
+**"ModuleNotFoundError: No module named 'requests'"**
+- The `requests` library is not installed. Try: `pip3 install requests` or use the pure-stdlib fallback.
+
+**"Connection refused" when querying Moonraker**
+- Verify Moonraker is running on the expected port (default: `http://127.0.0.1:7125`)
+- Check `REACH_LINK_MOONRAKER_URL` environment variable
+
+**Python 3 not found**
+- K1C ships with Python 3 by default, but if missing, contact Creality support or see your distro's package manager (e.g., `opkg install python3`)
+
+---
+
+## Supported Architectures
+
+| Architecture | Agent Type | Download |
+|--------------|-----------|----------|
+| ARM64 (Raspberry Pi 3/4/5, modern SBCs) | Rust binary | `reach-link-linux-arm64` |
+| x86_64 (Intel/AMD systems) | Rust binary | `reach-link-linux-x86_64` |
+| MIPS (Creality K1/K1C) | Python script | `reach-link-mips.py` |
+
+All agents use the same protocol and configuration, ensuring consistent behavior across platforms.
 
 ---
 
@@ -217,13 +290,14 @@ Open an issue on GitHub if you need MIPS support - we can add custom build pipel
 ```
 reach-link/
 ├── src/
-│   └── main.rs                  # Core binary (async Rust / tokio)
+│   ├── main.rs                  # Core Rust agent (async / tokio)
+│   └── reach-link-agent.py      # MIPS Python agent
 ├── build/
 │   ├── cross-build.sh           # Local cross-compilation helper
 │   └── artifacts/               # Cross-compiled binaries (git-ignored)
 ├── .github/
 │   └── workflows/
-│       └── release.yml          # CI/CD: build + publish GitHub Release
+│       └── release.yml          # CI/CD: build + publish GitHub Release (binaries + Python script)
 ├── Cargo.toml                   # Rust project manifest
 ├── Makefile                     # build / test / clean / cross targets
 ├── .gitignore

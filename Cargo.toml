@@ -1,8 +1,8 @@
 [package]
 name = "reach-link"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
-description = "Cross-platform printer agent for Klipper/Moonraker 3D printers"
+description = "Cross-platform printer agent for Klipper/Moonraker 3D printers (Rust + Python)"
 license = "MIT"
 
 [[bin]]

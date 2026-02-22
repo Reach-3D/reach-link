@@ -57,6 +57,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download arm64 artifact
         uses: actions/download-artifact@v4
         with:
@@ -69,13 +72,23 @@ jobs:
           name: reach-link-linux-x86_64
           path: dist/
 
+      - name: Prepare Python script for MIPS
+        run: |
+          cp src/reach-link-agent.py dist/reach-link-mips.py
+          chmod +x dist/reach-link-mips.py
+          sha256sum dist/reach-link-mips.py | awk '{print $1}' > dist/reach-link-mips.py.sha256
+          MIPS_SHA=$(cat dist/reach-link-mips.py.sha256)
+          echo "mips_sha=${MIPS_SHA}" >> $GITHUB_ENV
+
       - name: Read SHA-256 hashes
         id: hashes
         run: |
           ARM64_SHA=$(cat dist/reach-link-linux-arm64.sha256)
           X86_SHA=$(cat dist/reach-link-linux-x86_64.sha256)
+          MIPS_SHA=$(cat dist/reach-link-mips.py.sha256)
           echo "arm64_sha=${ARM64_SHA}" >> $GITHUB_OUTPUT
           echo "x86_sha=${X86_SHA}" >> $GITHUB_OUTPUT
+          echo "mips_sha=${MIPS_SHA}" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -83,8 +96,10 @@ jobs:
           files: |
             dist/reach-link-linux-arm64
             dist/reach-link-linux-x86_64
+            dist/reach-link-mips.py
             dist/reach-link-linux-arm64.sha256
             dist/reach-link-linux-x86_64.sha256
+            dist/reach-link-mips.py.sha256
           body: |
             ## reach-link ${{ github.ref_name }}
 
@@ -92,21 +107,51 @@ jobs:
 
             **SHA-256 (arm64):** `${{ steps.hashes.outputs.arm64_sha }}`
             **SHA-256 (x86_64):** `${{ steps.hashes.outputs.x86_sha }}`
+            **SHA-256 (MIPS):** `${{ steps.hashes.outputs.mips_sha }}`
 
-            > **Note:** MIPS builds (for Creality K1/K1C) require custom compilation. See README for instructions.
+            ### Downloads
+
+            #### ARM64 (Raspberry Pi, etc.)
+            ```bash
+            wget https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-linux-arm64
+            ```
+
+            #### x86_64 (Intel/AMD systems)
+            ```bash
+            wget https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-linux-x86_64
+            ```
+
+            #### MIPS (Creality K1/K1C - Python-based)
+            Requires Python 3.7+ and `requests` library
+            ```bash
+            wget https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-mips.py
+            chmod +x reach-link-mips.py
+            ```
 
             ### Usage in Reach3DCommercial
 
-            ```env
-            REACH_LINK_BINARY_URL=https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-linux-arm64
-            REACH_LINK_BINARY_SHA256=${{ steps.hashes.outputs.arm64_sha }}
-            ```
+            The installer automatically detects your printer's CPU architecture and deploys the correct agent.
 
-            ### Quick install (arm64)
-
+            #### Manual deployment (arm64)
             ```bash
             curl -fsSL https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-linux-arm64 \
-              -o /usr/local/bin/reach-link
-            echo "${{ steps.hashes.outputs.arm64_sha }}  /usr/local/bin/reach-link" | sha256sum -c
-            chmod +x /usr/local/bin/reach-link
+              -o reach-link
+            echo "${{ steps.hashes.outputs.arm64_sha }}  reach-link" | sha256sum -c
+            chmod +x reach-link
+            REACH_LINK_RELAY=https://relay.reach-3d.com \
+            REACH_LINK_TOKEN=your-token \
+            REACH_LINK_PRINTER_ID=printer-id \
+            ./reach-link
+            ```
+
+            #### Manual deployment (MIPS)
+            ```bash
+            curl -fsSL https://github.com/Reach-3D/reach-link/releases/download/${{ github.ref_name }}/reach-link-mips.py \
+              -o reach-link-agent.py
+            echo "${{ steps.hashes.outputs.mips_sha }}  reach-link-agent.py" | sha256sum -c
+            chmod +x reach-link-agent.py
+            REACH_LINK_RELAY=https://relay.reach-3d.com \
+            REACH_LINK_TOKEN=your-token \
+            REACH_LINK_PRINTER_ID=printer-id \
+            python3 reach-link-agent.py
             ```
