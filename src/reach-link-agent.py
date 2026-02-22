@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-reach-link MIPS agent
-Cross-platform printer agent for Klipper/Moonraker 3D printers (Python version for MIPS).
-Queries Moonraker API and sends heartbeats + telemetry to Reach3D relay server.
+reach-link Universal Agent
+Cross-platform printer agent for Klipper/Moonraker 3D printers (Python version for all platforms).
+Features: Heartbeat registration, telemetry collection, command proxying via RTDB, local/remote routing.
+Supports all architectures: MIPS, ARM64, x86_64, and others.
 """
 
 import asyncio
@@ -17,6 +18,8 @@ from typing import Any, Dict, Optional
 from urllib.error import URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
+import ipaddress
+import socket
 
 # Setup logging
 def setup_logging(log_file: Optional[str] = None) -> None:
@@ -58,11 +61,14 @@ class Config:
         self.printer_id = self._require_env_with_fallback(
             "REACH_LINK_PRINTER_ID", "REACH_PRINTER_ID"
         )
+        self.user_id = os.environ.get("REACH_LINK_USER_ID", "")
+        self.firebase_token = os.environ.get("REACH_LINK_FIREBASE_TOKEN", "")
+        self.printer_ip = os.environ.get("REACH_LINK_PRINTER_IP", "")
         self.moonraker_url = os.environ.get(
             "REACH_LINK_MOONRAKER_URL", "http://127.0.0.1:7125"
         ).rstrip("/")
         self.heartbeat_interval = int(
-            os.environ.get("REACH_LINK_HEARTBEAT_INTERVAL", "30")
+            os.environ.get("REACH_LINK_HEARTBEAT_INTERVAL", "60")
         )
         self.telemetry_interval = int(
             os.environ.get("REACH_LINK_TELEMETRY_INTERVAL", "10")
@@ -70,8 +76,8 @@ class Config:
         self.log_file = os.environ.get("REACH_LINK_LOG_FILE")
         
         # Validate
-        if not self.relay_url.startswith("https://"):
-            raise ValueError(f"REACH_LINK_RELAY must use HTTPS, got: {self.relay_url}")
+        if not self.relay_url.startswith("https://") and not self.relay_url.startswith("http://"):
+            raise ValueError(f"REACH_LINK_RELAY must use HTTPS or HTTP, got: {self.relay_url}")
         if not self.token.strip():
             raise ValueError("REACH_LINK_TOKEN must not be empty")
         if not self.printer_id.strip():
@@ -98,6 +104,46 @@ class Config:
             f"Required environment variable {primary} is not set "
             f"(fallback {fallback} also missing)"
         )
+
+# ============================================================================
+# Subnet Detection (for local vs remote routing)
+# ============================================================================
+
+class SubnetDetector:
+    """Detect if a user is on the same local network as the printer."""
+    
+    def __init__(self, printer_ip: str):
+        self.printer_ip = printer_ip
+    
+    def is_same_subnet(self, user_ip: str, subnet_mask: int = 24) -> bool:
+        """
+        Check if user_ip and printer_ip are on the same subnet.
+        Assumes /24 subnet (255.255.255.0) by default.
+        """
+        try:
+            printer_addr = ipaddress.ip_address(self.printer_ip)
+            user_addr = ipaddress.ip_address(user_ip)
+            
+            # Create /24 networks
+            printer_net = ipaddress.ip_network(f"{self.printer_ip}/24", strict=False)
+            user_net = ipaddress.ip_network(f"{user_ip}/24", strict=False)
+            
+            return printer_net == user_net
+        except ValueError:
+            # Invalid IP format, assume remote
+            return False
+    
+    def get_local_ip(self) -> Optional[str]:
+        """Get this machine's local IP (heuristic)."""
+        try:
+            # Connect to external host (doesn't actually send data)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception:
+            return None
 
 # ============================================================================
 # HTTP Client (stdlib-only, no external dependencies)
@@ -344,16 +390,25 @@ class ReachLinkAgent:
     
     async def run(self):
         """Main agent loop."""
-        logger.info(f"reach-link agent starting (version 1.0.4)")
+        logger.info(f"reach-link agent starting (version 1.0.5)")
         logger.info(
             f"relay_url={self.config.relay_url}, "
             f"printer_id={self.config.printer_id}, "
+            f"user_id={self.config.user_id}, "
             f"moonraker_url={self.config.moonraker_url}"
         )
         logger.info(
             f"heartbeat_interval={self.config.heartbeat_interval}s, "
             f"telemetry_interval={self.config.telemetry_interval}s"
         )
+        
+        # Log proxy/routing mode
+        if self.config.firebase_token and self.config.printer_ip:
+            logger.info("Firebase token and printer IP available - hybrid mode enabled (local + RTDB proxy)")
+        elif self.config.firebase_token:
+            logger.info("Firebase token available - RTDB proxy mode")
+        else:
+            logger.info("HTTP relay mode (legacy)")
         
         self.setup_signal_handlers()
         
