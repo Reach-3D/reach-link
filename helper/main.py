@@ -298,9 +298,17 @@ def main():
     # Setup executor
     HelperRequestHandler.executor = HelperExecutor()
 
-    # Start server
-    server = HTTPServer(('127.0.0.1', port), HelperRequestHandler)
-    logger.info(f'Server started at http://127.0.0.1:{port}')
+    # Start server on all interfaces (0.0.0.0) so it's accessible from other machines on LAN
+    server = HTTPServer(('0.0.0.0', port), HelperRequestHandler)
+    
+    # Get local IP for logging
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+    except:
+        local_ip = '127.0.0.1'
+    
+    logger.info(f'Server started at http://127.0.0.1:{port} (localhost)')
+    logger.info(f'LAN access: http://{local_ip}:{port}')
     logger.info('Waiting for requests (Ctrl+C to exit)...')
 
     try:
