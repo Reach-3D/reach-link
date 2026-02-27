@@ -2,7 +2,7 @@
 """
 reach-link Universal Agent
 Cross-platform printer agent for Klipper/Moonraker 3D printers (Python version for all platforms).
-Features: Heartbeat registration, telemetry collection, secure command polling via relay.
+Features: Heartbeat registration, telemetry collection, secure command polling via relay and RTDB.
 Supports all architectures: MIPS, ARM64, x86_64, and others.
 """
 
@@ -19,6 +19,12 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 import ipaddress
 import socket
+
+# Import Firebase RTDB client
+try:
+    from firebase_rtdb_client import FirebaseRealtimeDatabaseClient
+except ImportError:
+    FirebaseRealtimeDatabaseClient = None  # Will be handled gracefully below
 
 # Setup logging
 def setup_logging(log_file: Optional[str] = None) -> None:
@@ -75,6 +81,10 @@ class Config:
             os.environ.get("REACH_LINK_COMMAND_POLL_INTERVAL", "4")
         )
         self.log_file = os.environ.get("REACH_LINK_LOG_FILE")
+        
+        # Firebase RTDB configuration (optional, for cloud command queue)
+        self.firebase_database_url = os.environ.get("REACH_LINK_FIREBASE_DATABASE_URL", "")
+        self.firebase_token = os.environ.get("REACH_LINK_FIREBASE_TOKEN", "")
         
         # Validate
         if not self.relay_url.startswith("https://") and not self.relay_url.startswith("http://"):
@@ -431,16 +441,31 @@ class ReachLinkAgent:
         self.moonraker = MoonrakerClient(config.moonraker_url)
         self.relay = RelayClient(config.relay_url, config.token, config.printer_id)
         
+        # Initialize Firebase RTDB client if configured
+        self.firebase = None
+        if config.firebase_database_url and config.firebase_token:
+            if FirebaseRealtimeDatabaseClient:
+                try:
+                    self.firebase = FirebaseRealtimeDatabaseClient(
+                        config.firebase_database_url,
+                        config.firebase_token,
+                        config.printer_id,
+                    )
+                    logger.info("Firebase RTDB client initialized (cloud command queue enabled)")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize Firebase RTDB client: {e}")
+                    self.firebase = None
+            else:
+                logger.debug("Firebase RTDB client not available (firebase_rtdb_client module not found)")
+        else:
+            logger.debug("Firebase RTDB not configured (env vars not set)")
+        
         self.shutdown_event = asyncio.Event()
         self.start_time = time.time()
         self.last_heartbeat = 0.0
         self.last_telemetry = 0.0
         self.last_command_poll = 0.0
         self.token_revoked = False
-        self.start_time = time.time()
-        self.last_heartbeat = 0.0
-        self.last_telemetry = 0.0
-        self.last_command_poll = 0.0
     
     def setup_signal_handlers(self):
         """Register SIGTERM/SIGINT handlers for graceful shutdown."""
@@ -489,6 +514,77 @@ class ReachLinkAgent:
         except Exception as e:
             logger.error(f"Moonraker proxy error for {command}: {e}")
             return {"error": str(e), "errorCode": "moonraker_error"}
+    
+    def process_pending_firebase_commands(self) -> int:
+        """
+        Poll and process commands from Firebase RTDB
+        (supplement to relay server polling)
+        """
+        if not self.firebase:
+            return 0
+
+        try:
+            commands = self.firebase.get_queued_commands()
+            if not commands:
+                return 0
+
+            processed_count = 0
+            for command_id, command_data in commands.items():
+                try:
+                    command = command_data.get("command", "")
+                    args = command_data.get("args", {})
+
+                    if not command:
+                        logger.warning(f"Firebase command {command_id} has no command field")
+                        self.firebase.dequeue_command(command_id)
+                        continue
+
+                    logger.debug(f"Processing Firebase command {command_id}: {command}")
+
+                    # Mark as executing
+                    self.firebase.write_command_result(
+                        command_id,
+                        status="executing",
+                    )
+
+                    # Execute via Moonraker proxy
+                    result = self.proxy_command_to_moonraker(command, args)
+
+                    # Write result
+                    if "error" in result:
+                        self.firebase.write_command_result(
+                            command_id,
+                            status="failed",
+                            error=str(result.get("error", "unknown")),
+                        )
+                    else:
+                        self.firebase.write_command_result(
+                            command_id,
+                            status="completed",
+                            result=result,
+                        )
+
+                    # Dequeue the command
+                    self.firebase.dequeue_command(command_id)
+                    processed_count += 1
+
+                except Exception as e:
+                    logger.error(f"Error processing Firebase command {command_id}: {e}")
+                    try:
+                        self.firebase.write_command_result(
+                            command_id,
+                            status="failed",
+                            error=str(e),
+                        )
+                        self.firebase.dequeue_command(command_id)
+                    except Exception:
+                        pass
+
+            return processed_count
+
+        except Exception as e:
+            logger.error(f"Error in Firebase command processing: {e}")
+            return 0
     
     def process_pending_commands(self) -> int:
         """
@@ -591,7 +687,33 @@ class ReachLinkAgent:
                         try:
                             moonraker_status = self.moonraker.get_status()
                             if moonraker_status:
+                                # Send to HTTP relay
                                 self.relay.send_telemetry(moonraker_status)
+                                
+                                # Also update Firebase RTDB (cloud command queue)
+                                if self.firebase:
+                                    try:
+                                        # Extract status fields from moonraker_status
+                                        temperatures = moonraker_status.get("temperatures", {})
+                                        job = moonraker_status.get("job")
+                                        system_health = moonraker_status.get("system_health", {})
+                                        
+                                        # Determine printer state
+                                        printer_state = "idle"
+                                        if job and job.get("state") == "printing":
+                                            printer_state = "printing"
+                                        elif job and job.get("state") == "paused":
+                                            printer_state = "paused"
+                                        
+                                        # Write to RTDB
+                                        self.firebase.update_printer_status(
+                                            state=printer_state,
+                                            temperatures=temperatures,
+                                            job=job,
+                                            system_health=system_health,
+                                        )
+                                    except Exception as e:
+                                        logger.debug(f"Failed to update Firebase RTDB: {e}")
                         except ValueError as e:
                             if str(e) == "TOKEN_REVOKED":
                                 logger.critical("Token has been revoked by server. Agent will shut down.")
@@ -603,6 +725,15 @@ class ReachLinkAgent:
                 if now - self.last_command_poll >= self.config.command_poll_interval:
                     if not self.token_revoked:
                         self.process_pending_commands()
+                        
+                        # Also process Firebase RTDB commands (cloud command queue)
+                        try:
+                            firebase_count = self.process_pending_firebase_commands()
+                            if firebase_count > 0:
+                                logger.debug(f"Processed {firebase_count} Firebase command(s)")
+                        except Exception as e:
+                            logger.debug(f"Firebase command polling error: {e}")
+                    
                     self.last_command_poll = now
                 
                 # Sleep briefly to avoid busy-waiting
