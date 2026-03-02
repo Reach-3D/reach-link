@@ -52,6 +52,7 @@ def setup_logging(log_file: Optional[str] = None) -> None:
             print(f"Warning: Could not open log file {log_file}: {e}", file=sys.stderr)
 
 logger = logging.getLogger(__name__)
+AGENT_VERSION = "1.0.6"
 
 # ============================================================================
 # Configuration
@@ -62,10 +63,10 @@ class Config:
     
     def __init__(self):
         self.relay_url = self._require_env("REACH_LINK_RELAY")
-        self.token = self._require_env("REACH_LINK_TOKEN")
-        self.printer_id = self._require_env_with_fallback(
-            "REACH_LINK_PRINTER_ID", "REACH_PRINTER_ID"
-        )
+        self.token = os.environ.get("REACH_LINK_TOKEN", "").strip()
+        self.pairing_code = os.environ.get("REACH_LINK_PAIRING_CODE", "").strip()
+        self.state_file = os.environ.get("REACH_LINK_STATE_FILE", "./.reach-link-state.json").strip()
+        self.printer_id = os.environ.get("REACH_LINK_PRINTER_ID", "").strip() or os.environ.get("REACH_PRINTER_ID", "").strip()
         self.user_id = os.environ.get("REACH_LINK_USER_ID", "")
         self.printer_ip = os.environ.get("REACH_LINK_PRINTER_IP", "")
         self.moonraker_url = os.environ.get(
@@ -85,14 +86,70 @@ class Config:
         # Firebase RTDB configuration (optional, for cloud command queue)
         self.firebase_database_url = os.environ.get("REACH_LINK_FIREBASE_DATABASE_URL", "")
         self.firebase_token = os.environ.get("REACH_LINK_FIREBASE_TOKEN", "")
+
+        self._load_persisted_state()
         
         # Validate
         if not self.relay_url.startswith("https://") and not self.relay_url.startswith("http://"):
             raise ValueError(f"REACH_LINK_RELAY must use HTTPS or HTTP, got: {self.relay_url}")
-        if not self.token.strip():
-            raise ValueError("REACH_LINK_TOKEN must not be empty")
-        if not self.printer_id.strip():
-            raise ValueError("REACH_LINK_PRINTER_ID must not be empty")
+        if not self.token and not self.pairing_code:
+            raise ValueError(
+                "Bootstrap error: Neither REACH_LINK_TOKEN nor REACH_LINK_PAIRING_CODE is set.\n"
+                "First setup: Run the wizard in Reach3D dashboard to create a pairing session, "
+                "then run the setup command it provides.\n"
+                "Existing setup: Set REACH_LINK_TOKEN to the token saved during first setup."
+            )
+        if self.token and not self.printer_id:
+            raise ValueError("REACH_LINK_PRINTER_ID must not be empty when REACH_LINK_TOKEN is used")
+
+    def _load_persisted_state(self):
+        """Load persisted bootstrap credentials from disk if available."""
+        if not self.state_file:
+            return
+
+        try:
+            if not os.path.exists(self.state_file):
+                return
+
+            with open(self.state_file, "r", encoding="utf-8") as state_fp:
+                data = json.load(state_fp)
+
+            if not self.token:
+                self.token = str(data.get("reachLinkToken", "") or data.get("token", "")).strip()
+            if not self.printer_id:
+                self.printer_id = str(data.get("printerId", "") or data.get("reachLinkPrinterId", "")).strip()
+            if not self.user_id:
+                self.user_id = str(data.get("userId", "") or data.get("reachLinkUserId", "")).strip()
+            if data.get("relayUrl"):
+                self.relay_url = str(data.get("relayUrl")).strip().rstrip("/")
+
+            logger.info(f"Loaded persisted agent state from {self.state_file}")
+        except Exception as error:
+            logger.warning(f"Failed to load persisted state file {self.state_file}: {error}")
+
+    def persist_state(self):
+        """Persist active credentials to disk for restart/reboot resilience."""
+        if not self.state_file:
+            return
+
+        payload = {
+            "reachLinkToken": self.token,
+            "printerId": self.printer_id,
+            "userId": self.user_id,
+            "relayUrl": self.relay_url,
+            "savedAt": int(time.time()),
+        }
+
+        try:
+            parent_dir = os.path.dirname(self.state_file)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+
+            with open(self.state_file, "w", encoding="utf-8") as state_fp:
+                json.dump(payload, state_fp)
+            logger.info(f"Persisted agent state to {self.state_file}")
+        except Exception as error:
+            logger.warning(f"Failed to persist agent state to {self.state_file}: {error}")
     
     @staticmethod
     def _require_env(name: str) -> str:
@@ -167,15 +224,14 @@ class HTTPClient:
     def post_json(
         url: str,
         data: Dict[str, Any],
-        token: str,
+        token: Optional[str] = None,
         timeout: int = 10,
         max_retries: int = 3,
     ) -> Optional[Dict[str, Any]]:
         """POST JSON data with Bearer token auth; retry on failure."""
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         body = json.dumps(data).encode("utf-8")
         
         last_error = None
@@ -345,10 +401,10 @@ class RelayClient:
         self.token = token
         self.printer_id = printer_id
     
-    def register_heartbeat(self, uptime_secs: int, version: str = "1.0.0") -> bool:
+    def register_heartbeat(self, uptime_secs: int, version: str = "1.0.0") -> Optional[Dict[str, Any]]:
         """
         POST heartbeat to /api/reach-link/register.
-        Returns True if successful.
+        Returns response payload if successful.
         """
         url = urljoin(self.relay_url, "/api/reach-link/register")
         payload = {
@@ -362,8 +418,8 @@ class RelayClient:
         response = HTTPClient.post_json(url, payload, self.token, timeout=10)
         if response:
             logger.info(f"Heartbeat registered; next check-in: {response.get('nextCheckIn', '?')}s")
-            return True
-        return False
+            return response
+        return None
     
     def send_telemetry(self, moonraker_status: Dict[str, Any]) -> bool:
         """
@@ -438,6 +494,7 @@ class ReachLinkAgent:
     
     def __init__(self, config: Config):
         self.config = config
+        self._bootstrap_credentials_if_needed()
         self.moonraker = MoonrakerClient(config.moonraker_url)
         self.relay = RelayClient(config.relay_url, config.token, config.printer_id)
         
@@ -466,6 +523,47 @@ class ReachLinkAgent:
         self.last_telemetry = 0.0
         self.last_command_poll = 0.0
         self.token_revoked = False
+
+    def _bootstrap_credentials_if_needed(self):
+        """Claim pairing session if token is not pre-provisioned."""
+        if self.config.token and self.config.printer_id:
+            return
+
+        if not self.config.pairing_code:
+            raise ValueError(
+                "Missing credentials: set REACH_LINK_TOKEN or REACH_LINK_PAIRING_CODE"
+            )
+
+        claim_url = urljoin(self.config.relay_url, "/api/reach-link/pairing/claim")
+        payload = {
+            "pairingCode": self.config.pairing_code,
+            "agentVersion": AGENT_VERSION,
+            "moonrakerUrl": self.config.moonraker_url,
+            "printerIPAddress": self.config.printer_ip or (SubnetDetector("127.0.0.1").get_local_ip() or ""),
+            "hostname": socket.gethostname(),
+        }
+
+        logger.info("No REACH_LINK_TOKEN found, attempting pairing claim bootstrap...")
+        response = HTTPClient.post_json(claim_url, payload, token=None, timeout=10, max_retries=3)
+
+        if not response:
+            raise ValueError("Pairing claim failed: no response from relay")
+
+        token = str(response.get("reachLinkToken", "")).strip()
+        printer_id = str(response.get("printerId", "")).strip()
+        user_id = str(response.get("userId", "")).strip()
+        relay_url = str(response.get("relayUrl", self.config.relay_url)).strip().rstrip("/")
+
+        if not token or not printer_id:
+            raise ValueError("Pairing claim failed: missing reachLinkToken or printerId")
+
+        self.config.token = token
+        self.config.printer_id = printer_id
+        self.config.user_id = user_id or self.config.user_id
+        self.config.relay_url = relay_url or self.config.relay_url
+        self.config.persist_state()
+
+        logger.info(f"Pairing claim successful. Printer registered as {self.config.printer_id}")
     
     def setup_signal_handlers(self):
         """Register SIGTERM/SIGINT handlers for graceful shutdown."""
@@ -641,7 +739,7 @@ class ReachLinkAgent:
     
     async def run(self):
         """Main agent loop."""
-        logger.info(f"reach-link agent starting (version 1.0.5)")
+        logger.info(f"reach-link agent starting (version {AGENT_VERSION})")
         logger.info(
             f"relay_url={self.config.relay_url}, "
             f"printer_id={self.config.printer_id}, "
@@ -670,9 +768,16 @@ class ReachLinkAgent:
                                 "printerId": self.config.printer_id,
                                 "userId": self.config.user_id,
                                 "uptime": uptime,
-                                "version": "1.0.5",
+                                "version": AGENT_VERSION,
                             }
-                            self.relay.register_heartbeat(uptime)
+                            heartbeat_response = self.relay.register_heartbeat(uptime, version=AGENT_VERSION)
+                            if heartbeat_response and heartbeat_response.get("rotatedToken"):
+                                new_token = str(heartbeat_response.get("rotatedToken", "")).strip()
+                                if new_token:
+                                    self.config.token = new_token
+                                    self.relay.token = new_token
+                                    self.config.persist_state()
+                                    logger.info("Received and persisted rotated reach-link token after first heartbeat")
                         except ValueError as e:
                             if str(e) == "TOKEN_REVOKED":
                                 logger.critical("Token has been revoked by server. Agent will shut down.")
