@@ -52,7 +52,7 @@ def setup_logging(log_file: Optional[str] = None) -> None:
             print(f"Warning: Could not open log file {log_file}: {e}", file=sys.stderr)
 
 logger = logging.getLogger(__name__)
-AGENT_VERSION = "1.0.6"
+AGENT_VERSION = "1.0.7"
 
 # ============================================================================
 # Configuration
@@ -73,7 +73,7 @@ class Config:
             "REACH_LINK_MOONRAKER_URL", "http://127.0.0.1:7125"
         ).rstrip("/")
         self.heartbeat_interval = int(
-            os.environ.get("REACH_LINK_HEARTBEAT_INTERVAL", "60")
+            os.environ.get("REACH_LINK_HEARTBEAT_INTERVAL", "30")
         )
         self.telemetry_interval = int(
             os.environ.get("REACH_LINK_TELEMETRY_INTERVAL", "10")
@@ -244,11 +244,16 @@ class HTTPClient:
                         return json.loads(response_body)
                     return None
             except HTTPError as e:
-                # Check for 401 Unauthorized (token revocation)
+                # 401 = token revoked; 403 = invalid token; 404 = not found.
+                # None of these will succeed on retry — break immediately.
                 if e.code == 401:
                     logger.error(f"Token revocation detected (HTTP 401): {e.reason}")
                     raise ValueError("TOKEN_REVOKED")
-                
+                if e.code in (403, 404):
+                    logger.warning(f"HTTP POST received {e.code} (no retry): {e.reason}")
+                    last_error = e
+                    break
+
                 last_error = e
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
@@ -587,22 +592,34 @@ class ReachLinkAgent:
         """
         try:
             moonraker_base = "http://127.0.0.1:7125"
+            command_params = dict(params or {})
+            method = str(command_params.pop("__method", "POST")).upper()
+            query = command_params.pop("__query", {})
             
             # Construct Moonraker API endpoint
             # Most commands map directly: "printer.gcode" -> "/printer/gcode"
             path = "/" + command.replace(".", "/")
             url = f"{moonraker_base}{path}"
+            if isinstance(query, dict) and query:
+                from urllib.parse import urlencode
+                query_string = urlencode(query)
+                url = f"{url}?{query_string}"
             
-            # Build request body
-            body = json.dumps(params or {}).encode("utf-8")
-            
-            # POST to Moonraker
-            req = Request(
-                url,
-                data=body,
-                method="POST",
-                headers={"Content-Type": "application/json"}
-            )
+            # Build request
+            if method == "GET":
+                req = Request(
+                    url,
+                    method="GET",
+                    headers={"Content-Type": "application/json"}
+                )
+            else:
+                body = json.dumps(command_params or {}).encode("utf-8")
+                req = Request(
+                    url,
+                    data=body,
+                    method=method,
+                    headers={"Content-Type": "application/json"}
+                )
             
             with urlopen(req, timeout=10) as response:
                 response_data = json.loads(response.read().decode("utf-8"))
@@ -737,6 +754,109 @@ class ReachLinkAgent:
             return 0
     
     
+    # -----------------------------------------------------------------------
+    # Self-update
+    # -----------------------------------------------------------------------
+
+    def _parse_version(self, version_str: str) -> tuple:
+        """Parse a semver-like string into a comparable tuple, e.g. 'v1.0.7' -> (1, 0, 7)."""
+        try:
+            clean = version_str.lstrip("vV").strip()
+            return tuple(int(x) for x in clean.split("."))
+        except Exception:
+            return (0,)
+
+    def _check_for_update(self) -> None:
+        """
+        Check GitHub releases for a newer version of reach-link-agent.py.
+        If found: download, replace current script, exit so systemd can restart
+        the service with the new binary.
+        Safe: verifies the downloaded file before overwriting.
+        """
+        try:
+            import os as _os
+            api_url = "https://api.github.com/repos/Reach-3D/reach-link/releases/latest"
+            req = Request(
+                api_url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": f"reach-link-agent/{AGENT_VERSION}",
+                },
+            )
+            try:
+                with urlopen(req, timeout=10) as resp:
+                    release = json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                logger.debug(f"[auto-update] Release API call failed: {e}")
+                return
+
+            latest_tag = release.get("tag_name", "")
+            if not latest_tag:
+                return
+
+            current_version = self._parse_version(AGENT_VERSION)
+            latest_version = self._parse_version(latest_tag)
+
+            if latest_version <= current_version:
+                logger.info(f"[auto-update] Already up to date (v{AGENT_VERSION})")
+                return
+
+            logger.info(
+                f"[auto-update] New version available: {latest_tag} (current: v{AGENT_VERSION}). Updating..."
+            )
+
+            # Find the reach-link-agent.py asset in the release
+            asset_url: Optional[str] = None
+            for asset in release.get("assets", []):
+                name = asset.get("name", "")
+                if name in ("reach-link-agent.py", "reach-link.py"):
+                    asset_url = asset.get("browser_download_url")
+                    break
+
+            if not asset_url:
+                # Fallback: raw main branch
+                asset_url = (
+                    "https://raw.githubusercontent.com/Reach-3D/reach-link/main/src/reach-link-agent.py"
+                )
+                logger.debug(f"[auto-update] No release asset found, falling back to raw GitHub URL")
+
+            # Download to a temporary file
+            current_script = _os.path.abspath(__file__)
+            tmp_path = current_script + ".update_tmp"
+            try:
+                with urlopen(asset_url, timeout=30) as resp:
+                    content = resp.read()
+                if len(content) < 500:
+                    logger.warning("[auto-update] Downloaded file too small — aborting update")
+                    return
+                with open(tmp_path, "wb") as fh:
+                    fh.write(content)
+            except Exception as e:
+                logger.error(f"[auto-update] Download failed: {e}")
+                try:
+                    _os.remove(tmp_path)
+                except Exception:
+                    pass
+                return
+
+            # Atomic replace
+            try:
+                _os.replace(tmp_path, current_script)
+                logger.info(
+                    f"[auto-update] Updated to {latest_tag}. "
+                    "Exiting so the process manager can restart with the new version."
+                )
+                sys.exit(0)
+            except Exception as e:
+                logger.error(f"[auto-update] Failed to replace script: {e}")
+                try:
+                    _os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.warning(f"[auto-update] Unexpected error during update check: {e}")
+
     async def run(self):
         """Main agent loop."""
         logger.info(f"reach-link agent starting (version {AGENT_VERSION})")
@@ -752,7 +872,10 @@ class ReachLinkAgent:
         )
         
         logger.info("Relay command queue mode enabled")
-        
+
+        # Check for updates before entering the main loop
+        self._check_for_update()
+
         self.setup_signal_handlers()
         
         while not self.shutdown_event.is_set():
@@ -771,13 +894,18 @@ class ReachLinkAgent:
                                 "version": AGENT_VERSION,
                             }
                             heartbeat_response = self.relay.register_heartbeat(uptime, version=AGENT_VERSION)
-                            if heartbeat_response and heartbeat_response.get("rotatedToken"):
+                            if heartbeat_response:
+                                # Persist rotated token if the server issued one
                                 new_token = str(heartbeat_response.get("rotatedToken", "")).strip()
                                 if new_token:
                                     self.config.token = new_token
                                     self.relay.token = new_token
                                     self.config.persist_state()
                                     logger.info("Received and persisted rotated reach-link token after first heartbeat")
+                                # Respect the server's requested check-in interval
+                                next_check_in = heartbeat_response.get("nextCheckIn")
+                                if next_check_in and isinstance(next_check_in, (int, float)) and int(next_check_in) > 0:
+                                    self.config.heartbeat_interval = int(next_check_in)
                         except ValueError as e:
                             if str(e) == "TOKEN_REVOKED":
                                 logger.critical("Token has been revoked by server. Agent will shut down.")
