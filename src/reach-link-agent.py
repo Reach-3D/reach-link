@@ -711,6 +711,7 @@ class ReachLinkAgent:
         try:
             command_data = self.relay.pull_command()
             if not command_data:
+                # Poll succeeded but queue is empty - normal behavior
                 return 0
 
             request_id = command_data.get("requestId", "")
@@ -721,7 +722,7 @@ class ReachLinkAgent:
                 logger.warning("Received malformed relay command payload")
                 return 0
 
-            logger.debug(f"Processing relay command {request_id}: {command}")
+            logger.info(f"[relay-command] Processing: id={request_id}, command={command}")
             result = self.proxy_command_to_moonraker(command, params)
 
             if "error" in result:
@@ -957,15 +958,17 @@ class ReachLinkAgent:
                 # Process pending commands from relay queue
                 if now - self.last_command_poll >= self.config.command_poll_interval:
                     if not self.token_revoked:
+                        # Log every poll attempt for visibility
+                        logger.info(f"[relay-poll] Polling for commands (printerId={self.config.printer_id})")
                         self.process_pending_commands()
                         
                         # Also process Firebase RTDB commands (cloud command queue)
                         try:
                             firebase_count = self.process_pending_firebase_commands()
                             if firebase_count > 0:
-                                logger.debug(f"Processed {firebase_count} Firebase command(s)")
+                                logger.info(f"[firebase-command] Processed {firebase_count} Firebase command(s)")
                         except Exception as e:
-                            logger.debug(f"Firebase command polling error: {e}")
+                            logger.error(f"Firebase command polling error: {e}")
                     
                     self.last_command_poll = now
                 
