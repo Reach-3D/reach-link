@@ -79,7 +79,7 @@ class Config:
             os.environ.get("REACH_LINK_TELEMETRY_INTERVAL", "10")
         )
         self.command_poll_interval = int(
-            os.environ.get("REACH_LINK_COMMAND_POLL_INTERVAL", "4")
+            os.environ.get("REACH_LINK_COMMAND_POLL_INTERVAL", "2")
         )
         self.log_file = os.environ.get("REACH_LINK_LOG_FILE")
         
@@ -703,43 +703,48 @@ class ReachLinkAgent:
     
     def process_pending_commands(self) -> int:
         """
-        Pull one pending command from relay queue, execute on Moonraker,
-        and push command result back to relay.
-        Returns 1 when a command was processed, otherwise 0.
+        Drain the relay command queue: pull and execute commands until the queue
+        is empty, then return the total number of commands processed.
+        This prevents backlog build-up when the browser fires several requests
+        in the same poll window (e.g. when the printer overview tab refreshes).
         Raises ValueError("TOKEN_REVOKED") if token has been revoked by server.
         """
+        processed = 0
         try:
-            command_data = self.relay.pull_command()
-            if not command_data:
-                # Poll succeeded but queue is empty - normal behavior
-                return 0
+            while True:
+                command_data = self.relay.pull_command()
+                if not command_data:
+                    # Queue is empty - done for this cycle.
+                    break
 
-            request_id = command_data.get("requestId", "")
-            command = command_data.get("command", "")
-            params = command_data.get("params", {})
+                request_id = command_data.get("requestId", "")
+                command = command_data.get("command", "")
+                params = command_data.get("params", {})
 
-            if not request_id or not command:
-                logger.warning("Received malformed relay command payload")
-                return 0
+                if not request_id or not command:
+                    logger.warning("Received malformed relay command payload")
+                    continue
 
-            logger.info(f"[relay-command] Processing: id={request_id}, command={command}")
-            result = self.proxy_command_to_moonraker(command, params)
+                logger.info(f"[relay-command] Processing: id={request_id}, command={command}")
+                result = self.proxy_command_to_moonraker(command, params)
 
-            if "error" in result:
-                self.relay.push_command_result(
-                    request_id=request_id,
-                    status="failed",
-                    result=result,
-                    error=str(result.get("error", "moonraker_error")),
-                )
-            else:
-                self.relay.push_command_result(
-                    request_id=request_id,
-                    status="completed",
-                    result=result,
-                )
+                if "error" in result:
+                    self.relay.push_command_result(
+                        request_id=request_id,
+                        status="failed",
+                        result=result,
+                        error=str(result.get("error", "moonraker_error")),
+                    )
+                else:
+                    self.relay.push_command_result(
+                        request_id=request_id,
+                        status="completed",
+                        result=result,
+                    )
 
-            return 1
+                processed += 1
+
+            return processed
         except ValueError as e:
             if str(e) == "TOKEN_REVOKED":
                 logger.critical("Token has been revoked by server. Agent will shut down.")
@@ -748,11 +753,11 @@ class ReachLinkAgent:
                 )
                 self.token_revoked = True
                 self.shutdown_event.set()
-                return 0
+                return processed
             raise
         except Exception as e:
             logger.error(f"Error processing relay commands: {e}")
-            return 0
+            return processed
     
     
     # -----------------------------------------------------------------------
