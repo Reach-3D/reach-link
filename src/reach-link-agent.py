@@ -52,7 +52,7 @@ def setup_logging(log_file: Optional[str] = None) -> None:
             print(f"Warning: Could not open log file {log_file}: {e}", file=sys.stderr)
 
 logger = logging.getLogger(__name__)
-AGENT_VERSION = "1.0.7"
+AGENT_VERSION = "1.0.8"
 
 # ============================================================================
 # Configuration
