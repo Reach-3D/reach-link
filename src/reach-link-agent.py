@@ -528,6 +528,9 @@ class ReachLinkAgent:
         self.last_telemetry = 0.0
         self.last_command_poll = 0.0
         self.token_revoked = False
+        self.consecutive_empty_polls = 0
+        self.current_poll_interval = config.command_poll_interval
+        self._max_poll_interval = 5  # seconds — max backoff when idle
 
     def _bootstrap_credentials_if_needed(self):
         """Claim pairing session if token is not pre-provisioned."""
@@ -960,13 +963,26 @@ class ReachLinkAgent:
                                 self.shutdown_event.set()
                     self.last_telemetry = now
                 
-                # Process pending commands from relay queue
-                if now - self.last_command_poll >= self.config.command_poll_interval:
+                # Process pending commands from relay queue (adaptive backoff)
+                if now - self.last_command_poll >= self.current_poll_interval:
                     if not self.token_revoked:
-                        # Log every poll attempt for visibility
-                        logger.info(f"[relay-poll] Polling for commands (printerId={self.config.printer_id})")
-                        self.process_pending_commands()
-                        
+                        logger.debug(f"[relay-poll] Polling for commands (printerId={self.config.printer_id})")
+                        n = self.process_pending_commands()
+
+                        # Adaptive backoff: slow down when queue is consistently empty
+                        # to reduce idle RTDB reads; snap back fast on any command.
+                        if n == 0:
+                            self.consecutive_empty_polls += 1
+                            if self.consecutive_empty_polls >= 5:
+                                self.current_poll_interval = min(
+                                    self.current_poll_interval + 1,
+                                    self._max_poll_interval,
+                                )
+                        else:
+                            logger.info(f"[relay-poll] Processed {n} command(s)")
+                            self.consecutive_empty_polls = 0
+                            self.current_poll_interval = self.config.command_poll_interval
+
                         # Also process Firebase RTDB commands (cloud command queue)
                         try:
                             firebase_count = self.process_pending_firebase_commands()
@@ -974,7 +990,7 @@ class ReachLinkAgent:
                                 logger.info(f"[firebase-command] Processed {firebase_count} Firebase command(s)")
                         except Exception as e:
                             logger.error(f"Firebase command polling error: {e}")
-                    
+
                     self.last_command_poll = now
                 
                 # Sleep briefly to avoid busy-waiting
