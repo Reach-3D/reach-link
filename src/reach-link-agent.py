@@ -52,7 +52,7 @@ def setup_logging(log_file: Optional[str] = None) -> None:
             print(f"Warning: Could not open log file {log_file}: {e}", file=sys.stderr)
 
 logger = logging.getLogger(__name__)
-AGENT_VERSION = "1.0.8"
+AGENT_VERSION = "1.0.9"
 
 # ============================================================================
 # Configuration
@@ -682,7 +682,7 @@ class ReachLinkAgent:
             for command_id, command_data in commands.items():
                 try:
                     command = command_data.get("command", "")
-                    args = command_data.get("args", {})
+                    params = command_data.get("params", {})
 
                     if not command:
                         logger.warning(f"Firebase command {command_id} has no command field")
@@ -698,7 +698,7 @@ class ReachLinkAgent:
                     )
 
                     # Execute via Moonraker proxy
-                    result = self.proxy_command_to_moonraker(command, args)
+                    result = self.proxy_command_to_moonraker(command, params)
 
                     # Write result
                     if "error" in result:
@@ -809,63 +809,55 @@ class ReachLinkAgent:
 
     def _check_for_update(self) -> None:
         """
-        Check GitHub releases for a newer version of reach-link-agent.py.
-        If found: download, replace current script, exit so systemd can restart
-        the service with the new binary.
-        Safe: verifies the downloaded file before overwriting.
+        Check the Reach3D platform relay for a newer version of reach-link-agent.py.
+        Downloads via the platform API (no GitHub access required on the printer).
+        If a newer version is found: download, atomically replace current script,
+        then exit so systemd/supervisor can restart with the new version.
         """
         try:
             import os as _os
-            api_url = "https://api.github.com/repos/Reach-3D/reach-link/releases/latest"
+
+            # Step 1 — Check version from platform relay (no auth required)
+            version_url = f"{self.config.relay_url.rstrip('/')}/api/reach-link/version"
             req = Request(
-                api_url,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": f"reach-link-agent/{AGENT_VERSION}",
-                },
+                version_url,
+                headers={"User-Agent": f"reach-link-agent/{AGENT_VERSION}"},
             )
             try:
                 with urlopen(req, timeout=10) as resp:
-                    release = json.loads(resp.read().decode("utf-8"))
+                    data = json.loads(resp.read().decode("utf-8"))
             except Exception as e:
-                logger.debug(f"[auto-update] Release API call failed: {e}")
+                logger.debug(f"[auto-update] Version check failed: {e}")
                 return
 
-            latest_tag = release.get("tag_name", "")
-            if not latest_tag:
+            latest_version_str = data.get("version", "")
+            if not latest_version_str:
                 return
 
-            current_version = self._parse_version(AGENT_VERSION)
-            latest_version = self._parse_version(latest_tag)
-
-            if latest_version <= current_version:
+            if self._parse_version(latest_version_str) <= self._parse_version(AGENT_VERSION):
                 logger.info(f"[auto-update] Already up to date (v{AGENT_VERSION})")
                 return
 
             logger.info(
-                f"[auto-update] New version available: {latest_tag} (current: v{AGENT_VERSION}). Updating..."
+                f"[auto-update] New version available: v{latest_version_str} "
+                f"(current: v{AGENT_VERSION}). Downloading from platform..."
             )
 
-            # Find the reach-link-agent.py asset in the release
-            asset_url: Optional[str] = None
-            for asset in release.get("assets", []):
-                name = asset.get("name", "")
-                if name in ("reach-link-agent.py", "reach-link.py"):
-                    asset_url = asset.get("browser_download_url")
-                    break
+            # Step 2 — Download the new agent script from platform (auth required)
+            download_url = f"{self.config.relay_url.rstrip('/')}/api/reach-link/agent"
+            dl_req = Request(
+                download_url,
+                headers={
+                    "Authorization": f"Bearer {self.config.token}",
+                    "X-Printer-Id": self.config.printer_id,
+                    "User-Agent": f"reach-link-agent/{AGENT_VERSION}",
+                },
+            )
 
-            if not asset_url:
-                # Fallback: raw main branch
-                asset_url = (
-                    "https://raw.githubusercontent.com/Reach-3D/reach-link/main/src/reach-link-agent.py"
-                )
-                logger.debug(f"[auto-update] No release asset found, falling back to raw GitHub URL")
-
-            # Download to a temporary file
             current_script = _os.path.abspath(__file__)
             tmp_path = current_script + ".update_tmp"
             try:
-                with urlopen(asset_url, timeout=30) as resp:
+                with urlopen(dl_req, timeout=30) as resp:
                     content = resp.read()
                 if len(content) < 500:
                     logger.warning("[auto-update] Downloaded file too small — aborting update")
@@ -880,11 +872,11 @@ class ReachLinkAgent:
                     pass
                 return
 
-            # Atomic replace
+            # Step 3 — Atomic replace + restart
             try:
                 _os.replace(tmp_path, current_script)
                 logger.info(
-                    f"[auto-update] Updated to {latest_tag}. "
+                    f"[auto-update] Updated to v{latest_version_str}. "
                     "Exiting so the process manager can restart with the new version."
                 )
                 sys.exit(0)
