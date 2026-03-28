@@ -319,18 +319,22 @@ class MoonrakerClient:
     
     def get_status(self) -> Optional[Dict[str, Any]]:
         """
-        Query Moonraker for temperatures, job, system health.
-        Mimics the Rust binary's snapshot structure.
+        Query Moonraker for temperatures, job, system health, fans, and motion.
+        Provides rich telemetry for the RTDB live dashboard.
         """
         try:
-            # Query printer objects: temperatures (nozzle, bed), job state, cpu/memory
+            # Query printer objects: temperatures (nozzle, bed), job state, cpu/memory,
+            # fan speed, gcode move (feed rate / flow rate factors), toolhead position.
             query_url = (
                 f"{self.url}/printer/objects/query?"
                 "extruder=temperature,target&"
                 "heater_bed=temperature,target&"
-                "print_stats=filename,total_duration,print_duration,filament_used&"
+                "print_stats=filename,total_duration,print_duration,filament_used,state&"
                 "display_status=message&"
-                "system_stats=cputime,memavail,cpu_percent,memory"
+                "system_stats=cputime,memavail,cpu_percent,memory&"
+                "fan=speed&"
+                "gcode_move=speed,speed_factor,extrude_factor&"
+                "toolhead=position"
             )
             
             response = HTTPClient.get_json(query_url, timeout=5)
@@ -340,14 +344,38 @@ class MoonrakerClient:
             
             result = response.get("result", {})
             status = result.get("status", {})
+
+            extruder = status.get("extruder", {})
+            heater_bed = status.get("heater_bed", {})
             
-            # Extract temperatures
+            # Extract temperatures — include setpoint targets
             temperatures = {
-                "nozzle": status.get("extruder", {}).get("temperature"),
-                "bed": status.get("heater_bed", {}).get("temperature"),
-                "chamber": None,  # K1C doesn't typically have chamber sensor
+                "nozzle": extruder.get("temperature"),
+                "nozzleTarget": extruder.get("target"),
+                "bed": heater_bed.get("temperature"),
+                "bedTarget": heater_bed.get("target"),
+                "chamber": None,  # K1C doesn't typically have a chamber sensor
             }
-            
+
+            # Extract fan speed (part cooling fan, 0.0–1.0)
+            fan = status.get("fan", {})
+            fans = {
+                "partCooling": fan.get("speed"),
+            }
+
+            # Extract motion/positioning data
+            gcode_move = status.get("gcode_move", {})
+            toolhead = status.get("toolhead", {})
+            position = toolhead.get("position", [None, None, None, None])
+            motion = {
+                "x": position[0] if len(position) > 0 else None,
+                "y": position[1] if len(position) > 1 else None,
+                "z": position[2] if len(position) > 2 else None,
+                "speed": gcode_move.get("speed"),
+                "speedFactor": gcode_move.get("speed_factor"),
+                "extrudeFactor": gcode_move.get("extrude_factor"),
+            }
+
             # Extract job info
             print_stats = status.get("print_stats", {})
             job_state = print_stats.get("state", "unknown")
@@ -386,6 +414,8 @@ class MoonrakerClient:
             
             return {
                 "temperatures": temperatures,
+                "fans": fans,
+                "motion": motion,
                 "job": job,
                 "system_health": system_health,
             }
@@ -437,6 +467,8 @@ class RelayClient:
             "token": self.token,
             "timestamp": int(time.time() * 1000),
             "temperatures": moonraker_status.get("temperatures"),
+            "fans": moonraker_status.get("fans"),
+            "motion": moonraker_status.get("motion"),
             "job": moonraker_status.get("job"),
             "systemHealth": moonraker_status.get("system_health"),
             "errors": [],
