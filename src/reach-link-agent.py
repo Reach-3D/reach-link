@@ -52,7 +52,7 @@ def setup_logging(log_file: Optional[str] = None) -> None:
             print(f"Warning: Could not open log file {log_file}: {e}", file=sys.stderr)
 
 logger = logging.getLogger(__name__)
-AGENT_VERSION = "1.0.9"
+AGENT_VERSION = "1.0.10"
 
 # ============================================================================
 # Configuration
@@ -79,7 +79,7 @@ class Config:
             os.environ.get("REACH_LINK_TELEMETRY_INTERVAL", "10")
         )
         self.command_poll_interval = int(
-            os.environ.get("REACH_LINK_COMMAND_POLL_INTERVAL", "2")
+            os.environ.get("REACH_LINK_COMMAND_POLL_INTERVAL", "25")
         )
         self.log_file = os.environ.get("REACH_LINK_LOG_FILE")
         
@@ -334,7 +334,8 @@ class MoonrakerClient:
                 "system_stats=cputime,memavail,cpu_percent,memory&"
                 "fan=speed&"
                 "gcode_move=speed,speed_factor,extrude_factor&"
-                "toolhead=position"
+                "toolhead=position&"
+                "virtual_sdcard=progress,is_active,file_position"
             )
             
             response = HTTPClient.get_json(query_url, timeout=5)
@@ -378,6 +379,7 @@ class MoonrakerClient:
 
             # Extract job info
             print_stats = status.get("print_stats", {})
+            virtual_sdcard = status.get("virtual_sdcard", {})
             job_state = print_stats.get("state", "unknown")
             
             # Map Moonraker states to our enum
@@ -391,17 +393,28 @@ class MoonrakerClient:
             
             total_duration = print_stats.get("total_duration", 0)
             print_duration = print_stats.get("print_duration", 0)
-            progress = 0.0
-            if total_duration > 0:
-                progress = (print_duration / total_duration) * 100
+            # Use Klipper's file-read-based progress (0.0–1.0) — more accurate
+            # than the wall-clock ratio (print_duration / total_duration).
+            sdcard_progress = virtual_sdcard.get("progress", 0.0) or 0.0
+            progress = sdcard_progress * 100.0
+            
+            # Estimate remaining time from progress fraction and elapsed print time.
+            estimated_time = None
+            if sdcard_progress > 0.01 and print_duration > 0:
+                total_estimated = print_duration / sdcard_progress
+                estimated_time = int(max(0, total_estimated - print_duration))
+            
+            filament_used = print_stats.get("filament_used")
             
             job = {
                 "filename": print_stats.get("filename"),
                 "progress": min(progress, 100.0),
-                "eta": None,  # Could calculate from remaining time if needed
+                "eta": estimated_time,
                 "elapsedTime": int(print_duration),
                 "state": job_state,
                 "totaltime": int(total_duration),
+                "filamentUsed": filament_used,
+                "estimatedTime": estimated_time,
             }
             
             # Extract system health
@@ -484,6 +497,8 @@ class RelayClient:
     def pull_command(self) -> Optional[Dict[str, Any]]:
         """
         Poll relay for next queued command for this printer.
+        The server holds the connection for up to 25 s (long-poll), so we
+        allow a 30 s socket timeout to avoid premature disconnects.
         Returns command payload or None when queue is empty.
         """
         url = urljoin(self.relay_url, "/api/reach-link/commands/pull")
@@ -491,7 +506,7 @@ class RelayClient:
             "printerId": self.printer_id,
         }
 
-        response = HTTPClient.post_json(url, payload, self.token, timeout=10)
+        response = HTTPClient.post_json(url, payload, self.token, timeout=30)
         if not response:
             return None
 
@@ -560,9 +575,6 @@ class ReachLinkAgent:
         self.last_telemetry = 0.0
         self.last_command_poll = 0.0
         self.token_revoked = False
-        self.consecutive_empty_polls = 0
-        self.current_poll_interval = config.command_poll_interval
-        self._max_poll_interval = 5  # seconds — max backoff when idle
 
     def _bootstrap_credentials_if_needed(self):
         """Claim pairing session if token is not pre-provisioned."""
@@ -987,33 +999,18 @@ class ReachLinkAgent:
                                 self.shutdown_event.set()
                     self.last_telemetry = now
                 
-                # Process pending commands from relay queue (adaptive backoff)
-                if now - self.last_command_poll >= self.current_poll_interval:
+                # Process pending commands from relay queue.
+                # The pull endpoint long-polls for up to 25 s so this loop
+                # runs almost continuously — each call either returns a
+                # dispatched command immediately or holds ~25 s then returns
+                # empty, giving effectively real-time command delivery with
+                # near-zero idle reads.
+                if now - self.last_command_poll >= self.config.command_poll_interval:
                     if not self.token_revoked:
                         logger.debug(f"[relay-poll] Polling for commands (printerId={self.config.printer_id})")
                         n = self.process_pending_commands()
-
-                        # Adaptive backoff: slow down when queue is consistently empty
-                        # to reduce idle RTDB reads; snap back fast on any command.
-                        if n == 0:
-                            self.consecutive_empty_polls += 1
-                            if self.consecutive_empty_polls >= 5:
-                                self.current_poll_interval = min(
-                                    self.current_poll_interval + 1,
-                                    self._max_poll_interval,
-                                )
-                        else:
+                        if n > 0:
                             logger.info(f"[relay-poll] Processed {n} command(s)")
-                            self.consecutive_empty_polls = 0
-                            self.current_poll_interval = self.config.command_poll_interval
-
-                        # Also process Firebase RTDB commands (cloud command queue)
-                        try:
-                            firebase_count = self.process_pending_firebase_commands()
-                            if firebase_count > 0:
-                                logger.info(f"[firebase-command] Processed {firebase_count} Firebase command(s)")
-                        except Exception as e:
-                            logger.error(f"Firebase command polling error: {e}")
 
                     self.last_command_poll = now
                 
