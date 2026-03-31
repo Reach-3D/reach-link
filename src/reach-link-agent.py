@@ -52,7 +52,54 @@ def setup_logging(log_file: Optional[str] = None) -> None:
             print(f"Warning: Could not open log file {log_file}: {e}", file=sys.stderr)
 
 logger = logging.getLogger(__name__)
-AGENT_VERSION = "1.0.10"
+AGENT_VERSION = "1.0.11"
+
+# PID file used to prevent duplicate agent instances
+_PID_FILE = "/tmp/reach-link.pid"
+
+
+def _acquire_pid_lock() -> bool:
+    """Acquire a PID lock to prevent duplicate instances.
+
+    Returns True if this process acquired the lock.
+    Returns False if another instance is already running (caller should exit).
+    Stale lock files (dead PIDs) are silently replaced.
+    """
+    import atexit
+
+    if os.path.exists(_PID_FILE):
+        try:
+            with open(_PID_FILE, "r") as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 0)  # Signal 0 = "does this process exist?"
+            # Process IS running — another agent instance is alive.
+            return False
+        except (OSError, ValueError):
+            # Process is gone or PID file is corrupt — continue with fresh lock.
+            pass
+
+    try:
+        with open(_PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        atexit.register(_release_pid_lock)
+    except OSError as e:
+        # Non-fatal: /tmp might be read-only on some minimal OS builds.
+        print(f"Warning: could not write PID file {_PID_FILE}: {e}", file=sys.stderr)
+
+    return True
+
+
+def _release_pid_lock() -> None:
+    """Remove the PID lock file on clean exit."""
+    try:
+        if os.path.exists(_PID_FILE):
+            # Only remove if the file belongs to us.
+            with open(_PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            if pid == os.getpid():
+                os.remove(_PID_FILE)
+    except Exception:
+        pass
 
 # ============================================================================
 # Configuration
@@ -729,6 +776,19 @@ class ReachLinkAgent:
                 logger.debug(f"Moonraker responded to {command}: {response.status}")
                 return response_data
         
+        except HTTPError as e:
+            # 404/405/500 are expected for optional Moonraker add-ons
+            # (device_power, wled, spoolman, etc.) that aren't installed on
+            # this printer.  Log as WARNING so the log isn't flooded with
+            # red noise every time the dashboard opens.
+            if e.code in (404, 405, 500):
+                logger.warning(f"Moonraker endpoint unavailable for {command}: HTTP {e.code}")
+            else:
+                logger.error(f"Moonraker proxy error for {command}: HTTP {e.code} {e.reason}")
+            return {"error": str(e), "errorCode": "moonraker_error"}
+        except URLError as e:
+            logger.error(f"Moonraker proxy error for {command}: {e}")
+            return {"error": str(e), "errorCode": "moonraker_error"}
         except Exception as e:
             logger.error(f"Moonraker proxy error for {command}: {e}")
             return {"error": str(e), "errorCode": "moonraker_error"}
@@ -1099,6 +1159,17 @@ class ReachLinkAgent:
 
 def main():
     """Entry point."""
+    # Prevent duplicate instances — exit immediately if another agent is running.
+    if not _acquire_pid_lock():
+        with open(_PID_FILE, "r") as f:
+            existing_pid = f.read().strip()
+        print(
+            f"reach-link agent is already running (PID {existing_pid}). "
+            "Exiting to prevent duplicate instance.",
+            file=sys.stderr,
+        )
+        sys.exit(0)
+
     try:
         # Load config
         config = Config()
