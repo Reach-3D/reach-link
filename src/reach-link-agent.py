@@ -28,28 +28,32 @@ except ImportError:
 
 # Setup logging
 def setup_logging(log_file: Optional[str] = None) -> None:
-    """Configure logging to stdout and optional file."""
+    """Configure logging.
+
+    If REACH_LINK_LOG_FILE is set, log only to that file (the init script's
+    stdout redirect would double-write every line if we also kept a console
+    handler pointing at the same file).  Without a log_file we log to stdout
+    so that the shell redirect in the init script works as expected.
+    """
     log_level = logging.INFO
     log_format = "%(asctime)s [%(levelname)s] %(message)s"
-    
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(log_level)
-    console_handler.setFormatter(logging.Formatter(log_format))
-    
-    logger = logging.getLogger()
-    logger.setLevel(log_level)
-    logger.addHandler(console_handler)
-    
-    # File handler (optional)
+    formatter = logging.Formatter(log_format)
+
+    root = logging.getLogger()
+    root.setLevel(log_level)
+
     if log_file:
         try:
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setLevel(log_level)
-            file_handler.setFormatter(logging.Formatter(log_format))
-            logger.addHandler(file_handler)
+            handler: logging.Handler = logging.FileHandler(log_file)
         except Exception as e:
             print(f"Warning: Could not open log file {log_file}: {e}", file=sys.stderr)
+            handler = logging.StreamHandler(sys.stdout)
+    else:
+        handler = logging.StreamHandler(sys.stdout)
+
+    handler.setLevel(log_level)
+    handler.setFormatter(formatter)
+    root.addHandler(handler)
 
 logger = logging.getLogger(__name__)
 AGENT_VERSION = "1.0.11"
