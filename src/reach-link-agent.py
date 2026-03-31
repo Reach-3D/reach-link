@@ -87,6 +87,14 @@ class Config:
         self.firebase_database_url = os.environ.get("REACH_LINK_FIREBASE_DATABASE_URL", "")
         self.firebase_token = os.environ.get("REACH_LINK_FIREBASE_TOKEN", "")
 
+        # Webcam snapshot configuration
+        self.webcam_snapshot_interval = int(
+            os.environ.get("REACH_LINK_WEBCAM_INTERVAL", "5")
+        )
+        self.webcam_viewer_timeout = int(
+            os.environ.get("REACH_LINK_WEBCAM_VIEWER_TIMEOUT", "60")
+        )
+
         self._load_persisted_state()
         
         # Validate
@@ -437,6 +445,29 @@ class MoonrakerClient:
             logger.error(f"Error querying Moonraker: {e}")
             return None
 
+    def get_webcam_snapshot(self) -> Optional[bytes]:
+        """
+        Fetch a JPEG snapshot from the local webcam.
+        Crowsnest / mjpg-streamer serves snapshots at /webcam/?action=snapshot
+        proxied through Moonraker.
+        """
+        try:
+            snapshot_url = f"{self.url}/webcam/?action=snapshot"
+            req = Request(snapshot_url, method="GET")
+            with urlopen(req, timeout=10) as response:
+                content_type = response.headers.get("Content-Type", "")
+                if "image" not in content_type and "octet" not in content_type:
+                    logger.debug(f"Webcam snapshot unexpected content type: {content_type}")
+                    return None
+                data = response.read()
+                if len(data) < 100:
+                    logger.debug(f"Webcam snapshot too small ({len(data)} bytes)")
+                    return None
+                return data
+        except Exception as e:
+            logger.debug(f"Failed to capture webcam snapshot: {e}")
+            return None
+
 # ============================================================================
 # Reach3D Relay Client
 # ============================================================================
@@ -492,6 +523,30 @@ class RelayClient:
         if response:
             logger.debug("Telemetry sent successfully")
             return True
+        return False
+
+    def send_webcam_snapshot(self, jpeg_data: bytes) -> bool:
+        """
+        POST webcam JPEG snapshot to /api/reach-link/webcam-snapshot.
+        No retries — if one frame fails, the next capture will succeed.
+        """
+        url = urljoin(self.relay_url, "/api/reach-link/webcam-snapshot")
+        headers = {
+            "Content-Type": "image/jpeg",
+            "Authorization": f"Bearer {self.token}",
+            "X-Printer-Id": self.printer_id,
+        }
+        try:
+            req = Request(url, data=jpeg_data, headers=headers, method="POST")
+            with urlopen(req, timeout=15) as response:
+                logger.debug("Webcam snapshot uploaded successfully")
+                return True
+        except HTTPError as e:
+            logger.debug(f"Webcam snapshot upload failed (HTTP {e.code}): {e.reason}")
+        except (URLError, OSError) as e:
+            logger.debug(f"Webcam snapshot upload failed: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error uploading webcam snapshot: {e}")
         return False
 
     def pull_command(self) -> Optional[Dict[str, Any]]:
@@ -574,6 +629,7 @@ class ReachLinkAgent:
         self.last_heartbeat = 0.0
         self.last_telemetry = 0.0
         self.last_command_poll = 0.0
+        self.last_webcam_capture = 0.0
         self.token_revoked = False
 
     def _bootstrap_credentials_if_needed(self):
@@ -999,6 +1055,20 @@ class ReachLinkAgent:
                                 self.shutdown_event.set()
                     self.last_telemetry = now
                 
+                # Webcam snapshot (only when a viewer is active in the dashboard)
+                if now - self.last_webcam_capture >= self.config.webcam_snapshot_interval:
+                    if not self.token_revoked and self.firebase:
+                        try:
+                            viewer_ts = self.firebase.get_webcam_viewer_ts()
+                            if viewer_ts and (now * 1000 - viewer_ts) < (self.config.webcam_viewer_timeout * 1000):
+                                snapshot = self.moonraker.get_webcam_snapshot()
+                                if snapshot:
+                                    if self.relay.send_webcam_snapshot(snapshot):
+                                        logger.debug(f"Webcam snapshot sent ({len(snapshot)} bytes)")
+                        except Exception as e:
+                            logger.debug(f"Webcam snapshot error: {e}")
+                    self.last_webcam_capture = now
+
                 # Process pending commands from relay queue.
                 # The pull endpoint long-polls for up to 25 s so this loop
                 # runs almost continuously — each call either returns a

@@ -202,3 +202,14 @@ class FirebaseRealtimeDatabaseClient:
             return True
 
         return False
+
+    def get_webcam_viewer_ts(self) -> Optional[int]:
+        """
+        Read webcam viewer timestamp from RTDB.
+        Returns the timestamp (ms) if a viewer is active, else None.
+        """
+        path = f"/printers/{self.printer_id}/live/webcamViewerTs"
+        result = self._make_request(path, method="GET")
+        if isinstance(result, (int, float)):
+            return int(result)
+        return None
