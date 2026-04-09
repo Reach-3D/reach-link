@@ -537,12 +537,15 @@ class RelayClient:
         Returns response payload if successful.
         """
         url = urljoin(self.relay_url, "/api/reach-link/register")
+        # Always report current LAN IP so the platform stays in sync when DHCP reassigns
+        current_ip = self.config.printer_ip or (SubnetDetector("127.0.0.1").get_local_ip() or "")
         payload = {
             "printerId": self.printer_id,
             "token": self.token,
             "timestamp": int(time.time() * 1000),
             "uptime": uptime_secs,
             "version": version,
+            "printerIPAddress": current_ip,
         }
         
         response = HTTPClient.post_json(url, payload, self.token, timeout=10)

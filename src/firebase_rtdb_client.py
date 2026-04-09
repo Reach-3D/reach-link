@@ -139,10 +139,6 @@ class FirebaseRealtimeDatabaseClient:
         if result is None:
             return None
 
-        # Firebase returns null if path doesn't exist
-        if result is None:
-            return {}
-
         # Ensure result is a dict
         if isinstance(result, dict):
             return result
