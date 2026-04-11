@@ -76,8 +76,22 @@ def _acquire_pid_lock() -> bool:
             with open(_PID_FILE, "r") as f:
                 old_pid = int(f.read().strip())
             os.kill(old_pid, 0)  # Signal 0 = "does this process exist?"
-            # Process IS running — another agent instance is alive.
-            return False
+            # PID exists — verify it belongs to reach-link to guard against PID reuse.
+            # On minimal embedded OSes (K1C, MIPS boards) PIDs wrap quickly; a recycled
+            # PID would cause a false-positive "already running" and exit code 0, which
+            # supervisor treats as a clean exit and restarts — burning startretries fast.
+            is_reach_link = False
+            try:
+                with open(f"/proc/{old_pid}/cmdline", "rb") as cf:
+                    cmdline = cf.read().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+                is_reach_link = "reach-link" in cmdline
+            except (OSError, IOError):
+                # /proc not available (non-Linux) — assume the process is reach-link to be safe.
+                is_reach_link = True
+            if is_reach_link:
+                # Confirmed: another reach-link instance is alive.
+                return False
+            # PID was reused by a different process — treat lock as stale and continue.
         except (OSError, ValueError):
             # Process is gone or PID file is corrupt — continue with fresh lock.
             pass
@@ -113,6 +127,7 @@ class Config:
     """Load and validate configuration from environment."""
     
     def __init__(self):
+        self._load_env_file()  # Load .env from script dir before reading any env vars
         self.relay_url = self._require_env("REACH_LINK_RELAY")
         self.token = os.environ.get("REACH_LINK_TOKEN", "").strip()
         self.pairing_code = os.environ.get("REACH_LINK_PAIRING_CODE", "").strip()
@@ -209,7 +224,91 @@ class Config:
             logger.info(f"Persisted agent state to {self.state_file}")
         except Exception as error:
             logger.warning(f"Failed to persist agent state to {self.state_file}: {error}")
-    
+
+        # Also write credentials to .env so direct invocations survive reboots
+        self._write_env_file()
+
+    def _load_env_file(self) -> None:
+        """Load .env from the agent's own directory before reading env vars.
+
+        This allows running `python3 reach-link.py` directly after a reboot
+        without manually re-exporting env vars every session.  Explicit env
+        vars already set in the process take precedence over the file.
+        """
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        env_path = os.path.join(script_dir, '.env')
+        if not os.path.exists(env_path):
+            return
+        try:
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip()
+                    # Only set if not already in the process environment
+                    if key and not os.environ.get(key):
+                        os.environ[key] = value
+            print(f"[reach-link] Loaded credentials from {env_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"[reach-link] Warning: could not read {env_path}: {e}", file=sys.stderr)
+
+    def _write_env_file(self) -> None:
+        """Write current credentials back to .env in the agent's directory.
+
+        Called after every successful persist_state() so that credentials
+        obtained via pairing are immediately available on the next cold start
+        — regardless of whether launch.sh or a direct python3 invocation is
+        used.  Preserves any extra vars already present in the file.
+        """
+        if not (self.token and self.printer_id):
+            return  # Don't write an incomplete .env
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        env_path = os.path.join(script_dir, '.env')
+
+        managed_keys = {
+            'REACH_LINK_RELAY', 'REACH_LINK_TOKEN', 'REACH_LINK_PRINTER_ID',
+            'REACH_PRINTER_ID', 'REACH_LINK_USER_ID',
+        }
+        managed_lines = [
+            f"REACH_LINK_RELAY={self.relay_url}",
+            f"REACH_LINK_TOKEN={self.token}",
+            f"REACH_LINK_PRINTER_ID={self.printer_id}",
+            f"REACH_PRINTER_ID={self.printer_id}",
+            f"REACH_LINK_USER_ID={self.user_id}",
+        ]
+
+        # Preserve any extra vars already in the file (e.g. Firebase token,
+        # webcam interval, custom Moonraker URL set by the installer).
+        extra_lines: list = []
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, 'r', encoding='utf-8') as f:
+                    for raw in f:
+                        raw = raw.strip()
+                        if not raw or raw.startswith('#') or '=' not in raw:
+                            continue
+                        k, _, v = raw.partition('=')
+                        if k.strip() not in managed_keys:
+                            extra_lines.append(raw)
+            except Exception:
+                pass
+
+        all_lines = managed_lines + extra_lines
+        try:
+            with open(env_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(all_lines) + '\n')
+            try:
+                os.chmod(env_path, 0o600)
+            except Exception:
+                pass
+            logger.info(f"Credentials written to {env_path}")
+        except Exception as e:
+            logger.warning(f"Could not write .env file {env_path}: {e}")
+
     @staticmethod
     def _require_env(name: str) -> str:
         """Get required environment variable."""
@@ -736,7 +835,7 @@ class ReachLinkAgent:
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
     
-    def proxy_command_to_moonraker(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    def proxy_command_to_moonraker(self, command: str, params: Dict[str, Any], timeout: int = 10) -> Dict[str, Any]:
         """
         Proxy Moonraker API request to the printer's Moonraker instance.
         Routes relay command to local Moonraker instance on the printer.
@@ -778,7 +877,7 @@ class ReachLinkAgent:
                     headers={"Content-Type": "application/json"}
                 )
             
-            with urlopen(req, timeout=10) as response:
+            with urlopen(req, timeout=timeout) as response:
                 response_data = json.loads(response.read().decode("utf-8"))
                 logger.debug(f"Moonraker responded to {command}: {response.status}")
                 return response_data
@@ -800,6 +899,109 @@ class ReachLinkAgent:
             logger.error(f"Moonraker proxy error for {command}: {e}")
             return {"error": str(e), "errorCode": "moonraker_error"}
     
+    # -----------------------------------------------------------------------
+    # System commands (shutdown / uninstall)
+    # -----------------------------------------------------------------------
+
+    def _self_uninstall(self) -> None:
+        """Stop the supervisor/init service and remove all reach-link files.
+
+        Called when a `system.uninstall` command is received, which the server
+        sends automatically when the printer is deleted from the dashboard.
+        """
+        import shutil as _shutil
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        prefix = "[system.uninstall]"
+        logger.info(f"{prefix} Uninstalling reach-link agent...")
+
+        # Stop supervisor and remove its config so it won't restart us.
+        for ctl in [
+            "supervisorctl",
+            "/usr/bin/supervisorctl",
+            "/usr/local/bin/supervisorctl",
+            "/usr/sbin/supervisorctl",
+        ]:
+            try:
+                if os.path.exists(ctl) or _shutil.which(ctl):
+                    os.system(f"{ctl} stop reach-link 2>/dev/null")
+                    for conf_dir in [
+                        "/usr/data/printer_data/config/supervisor/conf.d",
+                        "/etc/supervisor/conf.d",
+                        "/etc/supervisord.d",
+                    ]:
+                        conf = os.path.join(conf_dir, "reach-link.conf")
+                        if os.path.exists(conf):
+                            try:
+                                os.remove(conf)
+                                logger.info(f"{prefix} Removed {conf}")
+                            except Exception:
+                                pass
+                    os.system(f"{ctl} reread 2>/dev/null; {ctl} update 2>/dev/null")
+                    break
+            except Exception:
+                pass
+
+        # Remove @reboot crontab entry if present.
+        try:
+            import subprocess as _sp
+            result = _sp.run(["crontab", "-l"], capture_output=True, text=True)
+            new_cron = "\n".join(
+                line for line in result.stdout.splitlines()
+                if "reach-link" not in line
+            )
+            _sp.run(["crontab", "-"], input=new_cron, text=True)
+        except Exception:
+            pass
+
+        # Remove rc.local entry.
+        rc_local = "/etc/rc.local"
+        try:
+            if os.path.exists(rc_local):
+                with open(rc_local, "r") as fh:
+                    lines = [ln for ln in fh.readlines() if "reach-link" not in ln]
+                with open(rc_local, "w") as fh:
+                    fh.writelines(lines)
+        except Exception:
+            pass
+
+        # Remove install directory.
+        try:
+            _shutil.rmtree(script_dir, ignore_errors=True)
+            logger.info(f"{prefix} Removed {script_dir}")
+        except Exception as e:
+            logger.warning(f"{prefix} Could not remove {script_dir}: {e}")
+
+        # Clean up PID file.
+        try:
+            if os.path.exists(_PID_FILE):
+                os.remove(_PID_FILE)
+        except Exception:
+            pass
+
+        logger.info(f"{prefix} Uninstall complete. Exiting.")
+        sys.exit(0)
+
+    def _handle_system_command(self, command: str) -> Optional[Dict[str, Any]]:
+        """Handle system.* agent control commands.
+
+        Returns a result dict if the command was handled, None to fall through
+        to the normal Moonraker proxy.
+        """
+        if command == "system.shutdown":
+            logger.info("[system.shutdown] Received shutdown command. Stopping agent.")
+            self.shutdown_event.set()
+            return {"status": "ok", "message": "agent shutting down"}
+
+        if command == "system.uninstall":
+            logger.info("[system.uninstall] Received uninstall command. Removing agent.")
+            # Run the uninstall in a separate thread so we can ack first.
+            import threading as _threading
+            _threading.Timer(1.0, self._self_uninstall).start()
+            return {"status": "ok", "message": "agent uninstalling"}
+
+        return None  # Not a system command
+
     def process_pending_firebase_commands(self) -> int:
         """
         Poll and process commands from Firebase RTDB
@@ -825,6 +1027,18 @@ class ReachLinkAgent:
                         continue
 
                     logger.debug(f"Processing Firebase command {command_id}: {command}")
+
+                    # Handle system control commands before proxying to Moonraker.
+                    system_result = self._handle_system_command(command)
+                    if system_result is not None:
+                        self.firebase.write_command_result(
+                            command_id,
+                            status="completed",
+                            result=system_result,
+                        )
+                        self.firebase.dequeue_command(command_id)
+                        processed_count += 1
+                        continue
 
                     # Mark as executing
                     self.firebase.write_command_result(
@@ -896,6 +1110,42 @@ class ReachLinkAgent:
                     continue
 
                 logger.info(f"[relay-command] Processing: id={request_id}, command={command}")
+
+                # Handle system control commands before proxying to Moonraker.
+                system_result = self._handle_system_command(command)
+                if system_result is not None:
+                    self.relay.push_command_result(
+                        request_id=request_id,
+                        status="completed",
+                        result=system_result,
+                    )
+                    processed += 1
+                    continue
+
+                # GCode script commands block Moonraker until the script finishes.
+                # Long operations (e.g. G28 homing, bed mesh calibration) can run for
+                # minutes — far beyond the normal proxy timeout.  Fire the request in a
+                # background thread and immediately acknowledge to the relay so the
+                # command loop stays responsive and the dashboard doesn't see a timeout.
+                if command == "printer.gcode.script":
+                    import threading
+                    def _run_gcode(cmd=command, p=dict(params or {})):
+                        bg_result = self.proxy_command_to_moonraker(cmd, p, timeout=600)
+                        if "error" in bg_result:
+                            logger.warning(
+                                f"[relay-command] GCode script error: {bg_result.get('error')}"
+                            )
+                        else:
+                            logger.info(f"[relay-command] GCode script completed: {p.get('script', '')}")
+                    threading.Thread(target=_run_gcode, daemon=True).start()
+                    self.relay.push_command_result(
+                        request_id=request_id,
+                        status="completed",
+                        result={"result": "accepted"},
+                    )
+                    processed += 1
+                    continue
+
                 result = self.proxy_command_to_moonraker(command, params)
 
                 if "error" in result:
