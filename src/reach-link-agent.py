@@ -56,7 +56,7 @@ def setup_logging(log_file: Optional[str] = None) -> None:
     root.addHandler(handler)
 
 logger = logging.getLogger(__name__)
-AGENT_VERSION = "1.0.11"
+AGENT_VERSION = "1.0.12"
 
 # PID file used to prevent duplicate agent instances
 _PID_FILE = "/tmp/reach-link.pid"
